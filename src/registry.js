@@ -9,9 +9,9 @@ import { isCoreTool } from "./definitions.js";
 const MIN_DESCRIPTION_LENGTH = 12;
 
 /**
- * Create, read, update and delete tools. Every write is validated before it touches the
- * store: name, schema, and source are each checked, and the assembled module is parsed.
- * Nothing here executes model-written code; that only happens in the worker.
+ * Create, read, update, restore and delete tools. Every write is validated before it
+ * touches the store: name, schema and source are each checked, and the assembled module
+ * is parsed. Nothing here executes model-written code; that only happens in the worker.
  */
 export class ToolRegistry {
   /** @param {{ store: import("./store.js").ToolStore, modulesDir: string }} options */
@@ -44,7 +44,7 @@ export class ToolRegistry {
     return tool;
   }
 
-  /** @param {string} name */
+  /** Previous versions, newest first, including deletions. @param {string} name */
   history(name) {
     return this.store.history(assertName(name));
   }
@@ -54,8 +54,10 @@ export class ToolRegistry {
    */
   async create(input) {
     const name = assertName(input?.name);
-    if (this.store.has(name)) {
-      throw new ToolError("exists", `Tool "${name}" already exists. Use update_tool to change it.`);
+    const collision = this.store.findCollision(name);
+    if (collision) {
+      const hint = collision === name ? "" : ` (names are case-insensitive; "${collision}" exists)`;
+      throw new ToolError("exists", `Tool "${name}" already exists${hint}. Use update_tool to change it.`);
     }
     const tool = assembleTool({
       name,
@@ -86,19 +88,32 @@ export class ToolRegistry {
     return this.#persist(tool, "update");
   }
 
+  /**
+   * Make a previous version current again. Works for deleted tools too.
+   * @param {string} name @param {number} versionId
+   */
+  async restore(name, versionId) {
+    const validName = assertName(name);
+    const version = Number.isInteger(versionId) ? this.store.getVersion(validName, versionId) : null;
+    if (!version) {
+      throw new ToolError("not_found", `Tool "${validName}" has no version ${versionId}. Use read_tool with include_history to list versions.`);
+    }
+    const tool = assembleTool({
+      name: validName,
+      description: version.description,
+      parameters: version.parameters,
+      executeSource: version.executeSource,
+      enabled: version.enabled
+    });
+    return this.#persist(tool, "restore");
+  }
+
   /** @param {string} name */
   async delete(name) {
     const removed = this.store.remove(assertName(name));
     if (!removed) throw new ToolError("not_found", `Tool "${name}" does not exist.`);
     await removeModule(this.modulesDir, removed.name);
-    return { name: removed.name };
-  }
-
-  /** Delete every tool. History is kept. */
-  async reset() {
-    const names = this.store.clear();
-    await Promise.all(names.map((name) => removeModule(this.modulesDir, name)));
-    return { deleted: names };
+    return { name: removed.name, versionId: removed.versionId };
   }
 
   async #persist(tool, operation) {

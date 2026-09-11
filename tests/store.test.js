@@ -9,7 +9,7 @@ const record = (overrides = {}) => ({
   description: "Echo the value back.",
   parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
   executeSource: "return args;",
-  moduleSource: "export const definition = {};\nexport async function execute(args, ctx) {\n  return args;\n}\n",
+  moduleSource: "export const definition = {};\nexport async function execute(args, ctx) {\nreturn args;\n}\n",
   enabled: true,
   ...overrides
 });
@@ -20,6 +20,7 @@ test("save, get, list, remove, and history", () =>
     try {
       const saved = store.save(record(), "create");
       assert.equal(saved.name, "echo");
+      assert.equal(typeof saved.versionId, "number");
       assert.equal("executeSource" in saved, false, "source is not returned unless asked for");
       assert.equal(store.get("echo", { includeSource: true }).executeSource, "return args;");
 
@@ -30,27 +31,37 @@ test("save, get, list, remove, and history", () =>
 
       const removed = store.remove("echo");
       assert.equal(removed.executeSource, "return 2;");
-      assert.equal(store.has("echo"), false);
+      assert.equal(store.get("echo"), null);
       assert.equal(store.remove("echo"), null);
 
+      const history = store.history("echo");
       assert.deepEqual(
-        store.history("echo").map((v) => v.operation),
-        ["delete", "update", "create"]
+        history.map((v) => [v.operation, v.executeSource, v.enabled]),
+        [
+          ["delete", "return 2;", false],
+          ["update", "return 2;", false],
+          ["create", "return args;", true]
+        ]
       );
+      assert.equal(store.getVersion("echo", history[2].id).executeSource, "return args;");
+      assert.equal(store.getVersion("echo", 999), null);
+      assert.equal(store.getVersion("other", history[2].id), null, "versions are scoped by name");
     } finally {
       store.close();
     }
   }));
 
-test("clear removes every tool and records each deletion", () =>
+test("names are unique ignoring case", () =>
   withTempDir((dir) => {
     const store = new ToolStore(path.join(dir, "t.sqlite"));
     try {
-      store.save(record({ name: "a" }), "create");
-      store.save(record({ name: "b" }), "create");
-      assert.deepEqual(store.clear(), ["a", "b"]);
-      assert.equal(store.list().length, 0);
-      assert.equal(store.history("b")[0].operation, "delete");
+      store.save(record({ name: "Echo" }), "create");
+      assert.equal(store.findCollision("echo"), "Echo");
+      assert.equal(store.findCollision("ECHO"), "Echo");
+      assert.equal(store.findCollision("other"), null);
+      assert.equal(store.get("echo"), null, "get is exact");
+      assert.throws(() => store.save(record({ name: "echo" }), "create"), (error) => error.code === "exists");
+      assert.equal(store.get("Echo").updatedAt, store.get("Echo").createdAt, "the colliding save touched nothing");
     } finally {
       store.close();
     }

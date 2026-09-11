@@ -37,7 +37,10 @@ test("create writes the store and a module file; update and delete keep them in 
 
       await registry.delete("echo");
       await assert.rejects(fs.access(file));
-      assert.equal(registry.history("echo").length, 4);
+      assert.deepEqual(
+        registry.history("echo").map((v) => [v.operation, v.enabled]),
+        [["delete", false], ["update", false], ["update", true], ["create", true]]
+      );
     } finally {
       store.close();
     }
@@ -50,6 +53,7 @@ test("validation failures name what to fix and never touch the store", () =>
       const good = { description: "Echo the value back.", parameters: echoSchema, executeSource: "return 1;" };
       const cases = [
         [{ ...good, name: "1bad" }, "invalid_name"],
+        [{ ...good, name: " echo" }, "invalid_name"],
         [{ ...good, name: "create_tool" }, "invalid_name"],
         [{ ...good, name: "ok", description: "short" }, "invalid_description"],
         [{ ...good, name: "ok", parameters: "{oops" }, "invalid_schema"],

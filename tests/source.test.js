@@ -37,11 +37,27 @@ test("braces inside strings, templates, comments and regex literals do not confu
   assert.doesNotMatch(body, /async function execute/);
 });
 
-test("a body that closes the function early is rejected", () => {
-  assert.throws(
-    () => unwrapExecuteSource("return 1; }\nconsole.log('escaped');\nasync function other() {"),
-    (error) => error.code === "invalid_source" && /closes the function early/.test(error.message)
-  );
+test("a body that closes the function early is rejected, whatever the stub is named", () => {
+  for (const source of [
+    "return 1; }\nconsole.log('escaped');\nasync function other() {",
+    "return 1; }\nglobalThis.escaped = 1;\nasync function execute(a, c) {",
+    "return 1; }\nexport const leaked = 1;\nasync function execute(a, c) {"
+  ]) {
+    assert.throws(
+      () => unwrapExecuteSource(source),
+      (error) => error.code === "invalid_source" && /closes the function early/.test(error.message),
+      source
+    );
+  }
+});
+
+test("the body is stored verbatim: multi-line templates and line continuations survive", () => {
+  const body = "const sql = `SELECT *\nFROM t\n    WHERE x = 1`;\nconst s = 'a\\\nb';\nreturn { sql, s };";
+  assert.equal(unwrapExecuteSource(body), body);
+  const wrapped = `async function execute(args, ctx) {\n  ${body.split("\n").join("\n  ")}\n}`;
+  const unwrapped = unwrapExecuteSource(wrapped);
+  assert.equal(unwrapped.split("\n")[0], "const sql = `SELECT *", "only the edges are trimmed");
+  assert.match(unwrapped, /\n  FROM t\n {6}WHERE x = 1`;/, "interior lines keep the indentation the model wrote");
 });
 
 test("a syntax error reports the line inside the body", () => {
@@ -65,6 +81,6 @@ test("the assembled module has exactly the expected exports", () => {
   });
   assert.doesNotThrow(() => assertModuleSource(moduleSource));
   assert.match(moduleSource, /export const definition = \{/);
-  assert.match(moduleSource, /export async function execute\(args, ctx\) \{\n {2}return args;\n\}/);
+  assert.match(moduleSource, /export async function execute\(args, ctx\) \{\nreturn args;\n\}/);
   assert.throws(() => assertModuleSource(moduleSource + "\nconsole.log(1);"), (error) => error.code === "invalid_source");
 });

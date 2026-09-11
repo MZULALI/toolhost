@@ -11,11 +11,17 @@ export function modulePath(modulesDir, name) {
   return path.join(modulesDir, `${name}.mjs`);
 }
 
-/** @param {string} modulesDir @param {{ name: string, moduleSource: string }} tool */
+/**
+ * Write atomically (temp file + rename) so a worker starting mid-write never imports a
+ * half-written module.
+ * @param {string} modulesDir @param {{ name: string, moduleSource: string }} tool
+ */
 export async function writeModule(modulesDir, tool) {
   await fs.mkdir(modulesDir, { recursive: true });
   const target = modulePath(modulesDir, tool.name);
-  await fs.writeFile(target, tool.moduleSource, "utf8");
+  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(temp, tool.moduleSource, "utf8");
+  await fs.rename(temp, target);
   return target;
 }
 

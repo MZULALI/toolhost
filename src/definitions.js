@@ -11,7 +11,8 @@ function objectSchema(properties, required = Object.keys(properties)) {
 const CONTEXT_DOCS =
   "ctx provides: workspace (string), readText(path), writeText(path, text), appendText(path, text), " +
   "listFiles(dir), fetchJson(url, init), exec(command, { cwd, timeoutMs, env }) when the host enables it, " +
-  "and callTool(name, args) to call another generated tool.";
+  "and callTool(name, args) to call another generated tool. " +
+  "Return a plain JSON value (object, array, string, number, boolean or null); anything else is dropped or rejected.";
 
 export const coreTools = Object.freeze([
   {
@@ -23,7 +24,7 @@ export const coreTools = Object.freeze([
     parameters: objectSchema({
       name: {
         type: "string",
-        description: "Start with a letter; letters, digits and underscores only."
+        description: "Start with a letter; letters, digits and underscores only. Names are case-insensitive."
       },
       description: {
         type: "string",
@@ -36,8 +37,8 @@ export const coreTools = Object.freeze([
       execute_source: {
         type: "string",
         description:
-          "JavaScript body of `async function execute(args, ctx)`. Return a JSON-serialisable value. " +
-          "If you include the outer function it is unwrapped."
+          "JavaScript body of `async function execute(args, ctx)`. " +
+          "If you include the outer function it is unwrapped. The source is stored exactly as sent."
       }
     })
   },
@@ -53,42 +54,53 @@ export const coreTools = Object.freeze([
   },
   {
     name: "read_tool",
-    description: "Read one tool's description, parameter schema, and optionally its source.",
-    parameters: objectSchema({
-      name: { type: "string", description: "Tool name." },
-      include_source: { type: "boolean", description: "Include execute_source." }
-    })
+    description:
+      "Read one tool's description, parameter schema, and optionally its source and version history. " +
+      "Use the history to see what a tool looked like before a change broke it.",
+    parameters: objectSchema(
+      {
+        name: { type: "string", description: "Tool name." },
+        include_source: { type: "boolean", description: "Include execute_source." },
+        include_history: { type: "boolean", description: "Include previous versions, newest first, with their source." }
+      },
+      ["name", "include_source"]
+    )
   },
   {
     name: "update_tool",
     description:
       "Change an existing tool. Omit a field to keep its current value. " +
-      "Use this to fix a tool that failed, extend it, or disable and re-enable it.",
+      "Use this to fix a tool that failed, extend it, disable and re-enable it, " +
+      "or roll back with restore_version (a version id from read_tool's history).",
     parameters: objectSchema(
       {
         name: { type: "string", description: "Existing tool name." },
         description: { type: "string", description: "New description." },
         parameters_json: { type: "string", description: "New JSON Schema string." },
         execute_source: { type: "string", description: "New function body." },
-        enabled: { type: "boolean", description: "Whether the tool is callable." }
+        enabled: { type: "boolean", description: "Whether the tool is callable." },
+        restore_version: {
+          type: "integer",
+          description: "Restore this version id from history. Other fields are ignored when set."
+        }
       },
       ["name"]
     )
   },
   {
     name: "delete_tool",
-    description: "Delete a tool. Its history is kept.",
+    description: "Delete a tool. Its history is kept and it can be restored with update_tool.restore_version.",
     parameters: objectSchema({
       name: { type: "string", description: "Tool name." }
     })
   }
 ]);
 
-const coreToolNames = new Set(coreTools.map((tool) => tool.name));
+const coreToolNames = new Set(coreTools.map((tool) => tool.name.toLowerCase()));
 
-/** @param {string} name */
+/** Case-insensitive, matching the store's uniqueness rule. @param {string} name */
 export function isCoreTool(name) {
-  return coreToolNames.has(name);
+  return typeof name === "string" && coreToolNames.has(name.toLowerCase());
 }
 
 /** Anthropic Messages API: `{ name, description, input_schema }`. */

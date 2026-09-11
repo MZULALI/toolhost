@@ -50,8 +50,9 @@ function normalizeNode(node) {
     for (const child of Object.values(node.properties)) normalizeNode(child);
   }
 
-  if (node.items) normalizeNode(node.items);
-  for (const key of ["anyOf", "oneOf", "allOf"]) {
-    if (Array.isArray(node[key])) node[key].forEach(normalizeNode);
+  for (const key of ["items", "prefixItems", "anyOf", "oneOf", "allOf"]) {
+    const value = node[key];
+    if (Array.isArray(value)) value.forEach(normalizeNode);
+    else if (value) normalizeNode(value);
   }
 }
