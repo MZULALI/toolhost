@@ -6,6 +6,7 @@ import { ToolError, errorCode, errorMessage } from "./errors.ts";
 import { DEFAULT_MAX_SOURCE_BYTES, ToolRegistry, type HistoryOptions } from "./registry.ts";
 import { ToolStore } from "./storage/store.ts";
 import type { Capabilities, HostStatus, LogEntry, Tool, ToolDefinition, ToolHostOptions, ToolVersion } from "./types.ts";
+import { validateArgs } from "./validate/args.ts";
 import { assertUserToolName, isCoreTool } from "./validate/names.ts";
 import { ToolWorkerClient } from "./worker/client.ts";
 
@@ -42,6 +43,7 @@ export class ToolHost {
   readonly #modulesDir: string;
   readonly #maxSourceBytes: number;
   readonly #onLog: (entry: LogEntry) => void;
+  readonly #validateArgs: boolean;
   /** Built-in tool calls in progress; stop() waits for them so a late restart cannot outlive it. */
   readonly #coreCalls = new Set<Promise<unknown>>();
 
@@ -57,7 +59,10 @@ export class ToolHost {
     maxCrashRestarts,
     maxResultBytes = 1_000_000,
     maxSourceBytes = DEFAULT_MAX_SOURCE_BYTES,
-    onLog = noop
+    onLog = noop,
+    permissions = false,
+    workerEnv = {},
+    validateArgs: shouldValidateArgs = true
   }: ToolHostOptions) {
     if (!dir) throw new ToolError("invalid_argument", "ToolHost requires a `dir` to store its database and modules.");
     assertPositiveInteger({ callTimeoutMs, readyTimeoutMs, killGraceMs, drainTimeoutMs, maxResultBytes, maxSourceBytes });
@@ -70,6 +75,12 @@ export class ToolHost {
     if (autoRestart !== undefined && typeof autoRestart !== "boolean") {
       throw new ToolError("invalid_argument", "autoRestart must be a boolean.");
     }
+    if (typeof permissions !== "boolean" || typeof shouldValidateArgs !== "boolean") {
+      throw new ToolError("invalid_argument", "permissions and validateArgs must be booleans.");
+    }
+    if (!workerEnv || typeof workerEnv !== "object" || Object.values(workerEnv).some((v) => typeof v !== "string")) {
+      throw new ToolError("invalid_argument", "workerEnv must be an object of string values.");
+    }
     this.dir = path.resolve(dir);
     this.workspace = path.resolve(workspace);
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...capabilities };
@@ -79,6 +90,7 @@ export class ToolHost {
     this.#lockPath = path.join(this.dir, ".lock");
     this.#maxSourceBytes = maxSourceBytes;
     this.#onLog = onLog;
+    this.#validateArgs = shouldValidateArgs;
 
     this.worker = new ToolWorkerClient({
       config: { dir: this.dir, dbPath: this.#dbPath, modulesDir: this.#modulesDir, workspace: this.workspace, capabilities: this.capabilities, maxResultBytes },
@@ -86,7 +98,9 @@ export class ToolHost {
       killGraceMs,
       drainTimeoutMs,
       autoRestart,
-      maxCrashRestarts
+      maxCrashRestarts,
+      permissions,
+      workerEnv
     });
     this.worker.on("log", (entry) => this.#onLog(entry));
     this.worker.on("warning", ({ kind, error }) => this.#onLog({ stream: "stderr", text: `${kind}: ${error?.message}\n` }));
@@ -101,6 +115,15 @@ export class ToolHost {
         throw new ToolError("invalid_argument", `workspace does not exist: ${this.workspace}`);
       }
       acquireLock(this.#lockPath);
+      // The worker gets real paths. Under Node's permission model the ESM loader walks every
+      // path component, and a symlinked ancestor (macOS's /var -> /private/var) would be denied.
+      const realDir = fs.realpathSync(this.dir);
+      Object.assign(this.worker.config, {
+        dir: realDir,
+        dbPath: path.join(realDir, "tools.sqlite"),
+        modulesDir: path.join(realDir, "modules"),
+        workspace: fs.realpathSync(this.workspace)
+      });
     } catch (error) {
       throw asStartError(error, this.dir);
     }
@@ -148,7 +171,10 @@ export class ToolHost {
       this.#assertOpen();
       if (typeof name !== "string") throw new ToolError("invalid_name", "Tool name must be a string.");
       const input: Args = args && typeof args === "object" ? args : {};
-      if (!isCoreTool(name)) return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
+      if (!isCoreTool(name)) {
+        this.#checkArgs(name, input);
+        return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
+      }
       const pending = this.#callCore(name.toLowerCase(), input);
       this.#coreCalls.add(pending);
       try {
@@ -180,6 +206,19 @@ export class ToolHost {
       capabilities: this.capabilities,
       worker: this.worker.status()
     };
+  }
+
+  /** Reject arguments that do not fit the tool's schema, with problems the model can fix. */
+  #checkArgs(name: string, args: Args): void {
+    if (!this.#validateArgs) return;
+    const tool = this.store?.get(name);
+    if (!tool || !tool.enabled) return; // the worker reports not_found
+    const problems = validateArgs(tool.parameters, args);
+    if (problems.length) {
+      throw new ToolError("invalid_arguments", `Arguments for "${name}" do not match its schema: ${problems.join("; ")}.`, {
+        problems
+      });
+    }
   }
 
   #assertOpen(): ToolRegistry {
@@ -285,7 +324,8 @@ export class ToolHost {
       await rollback(value).catch(noop);
       await this.worker.restart(`rollback:${reason}`).catch(noop);
       throw new ToolError("worker_unavailable", `The change was rolled back because the worker could not restart: ${errorMessage(error)}`, {
-        cause: errorCode(error)
+        cause: errorCode(error),
+        ...(error instanceof ToolError ? error.details : {})
       });
     }
     return value;

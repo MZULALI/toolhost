@@ -15,5 +15,5 @@ export async function withTempDir<T>(fn: (dir: string) => Promise<T> | T): Promi
 export const echoSchema = {
   type: "object",
   properties: { value: { type: "string", description: "Value to echo." } },
-  required: ["value"]
+  required: [] // most tests call with {}; argument validation has its own tests
 };

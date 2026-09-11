@@ -575,6 +575,70 @@ test("stop() waits for in-flight calls", () =>
     assert.equal(await inflight, "done");
   }));
 
+test("the worker does not inherit the parent's environment; workerEnv adds what a tool needs", () =>
+  withTempDir(async (dir) => {
+    process.env.TOOLHOST_TEST_SECRET = "leak";
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, workerEnv: { GIVEN: "yes" }, ...quiet });
+    try {
+      await create(host, "env", "return { secret: process.env.TOOLHOST_TEST_SECRET ?? null, given: process.env.GIVEN ?? null, path: typeof process.env.PATH };");
+      assert.deepEqual(await call(host, "env", {}), { secret: null, given: "yes", path: "string" });
+    } finally {
+      delete process.env.TOOLHOST_TEST_SECRET;
+      await host.stop();
+    }
+  }));
+
+test("with permissions on, a tool cannot read outside the workspace or spawn, even via node:fs", () =>
+  withTempDir(async (dir) => {
+    const workspace = path.join(dir, "ws");
+    await fs.mkdir(workspace);
+    await fs.writeFile(path.join(workspace, "in.txt"), "inside");
+    await fs.writeFile(path.join(dir, "out.txt"), "outside");
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace, permissions: true, ...quiet });
+    try {
+      await create(host, "rawread", "const fs = await import('node:fs/promises'); return fs.readFile(args.value, 'utf8');");
+      await create(host, "spawn", "const { execSync } = await import('node:child_process'); return String(execSync('echo hi'));");
+      // Node's permission model matches paths as given, so a tool must use the real workspace path (ctx.workspace).
+      assert.equal(await call(host, "rawread", { value: path.join(await fs.realpath(workspace), "in.txt") }), "inside");
+      await assert.rejects(call(host, "rawread", { value: path.join(await fs.realpath(dir), "out.txt") }), (error: any) => error.code === "call_failed" && error.details.remoteCode === "ERR_ACCESS_DENIED");
+      await assert.rejects(call(host, "spawn", {}), (error: any) => error.code === "call_failed" && error.details.remoteCode === "ERR_ACCESS_DENIED");
+      await create(host, "viactx", "return ctx.readText('in.txt');");
+      assert.equal(await call(host, "viactx", {}), "inside", "the helpers still work under the permission model");
+      assert.ok(host.worker.execArgv().includes("--permission"));
+    } finally {
+      await host.stop();
+    }
+    const withExec = await createToolHost({ dir: path.join(dir, "host2"), workspace, permissions: true, capabilities: { exec: true }, ...quiet });
+    try {
+      await create(withExec, "sh", "return ctx.exec('echo hi');");
+      assert.equal((await call(withExec, "sh", {})).stdout.trim(), "hi", "exec is allowed when the capability is on");
+    } finally {
+      await withExec.stop();
+    }
+  }));
+
+test("arguments are validated against the tool's schema before the call reaches the worker", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    try {
+      await create(host, "typed", "return args.value.toUpperCase();", { type: "object", properties: { value: { type: "string" } }, required: ["value"] });
+      assert.equal(await call(host, "typed", { value: "ok" }), "OK");
+      await assert.rejects(call(host, "typed", { value: 5 }), (error: any) => error.code === "invalid_arguments" && /args.value must be string, got number 5/.test(error.message));
+      await assert.rejects(call(host, "typed", {}), (error: any) => error.code === "invalid_arguments" && /args.value is required/.test(error.message));
+      await assert.rejects(call(host, "typed", { value: "ok", extra: 1 }), (error: any) => error.code === "invalid_arguments" && error.details.problems.length === 1);
+      await assert.rejects(call(host, "unknown_tool", { value: 5 }), (error: any) => error.code === "not_found", "unknown tools are still reported by the worker");
+    } finally {
+      await host.stop();
+    }
+    const loose = await createToolHost({ dir: path.join(dir, "host2"), workspace: dir, validateArgs: false, ...quiet });
+    try {
+      await create(loose, "typed", "return typeof args.value;", { type: "object", properties: { value: { type: "string" } }, required: ["value"] });
+      assert.equal(await call(loose, "typed", { value: 5 }), "number");
+    } finally {
+      await loose.stop();
+    }
+  }));
+
 test("exec runs with a minimal environment when enabled", () =>
   withTempDir(async (dir) => {
     process.env.TOOLHOST_TEST_SECRET = "leak";

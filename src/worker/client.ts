@@ -1,6 +1,7 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { realpathSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { ToolError } from "../errors.ts";
@@ -42,6 +43,31 @@ const HEALTHY_AFTER_MS = 30_000;
 
 const USE_PROCESS_GROUPS = process.platform !== "win32";
 
+/**
+ * What the worker process is allowed to see of the parent's environment. Model-written code
+ * runs there, so API keys and everything else stay behind; `workerEnv` adds back what a tool
+ * legitimately needs.
+ */
+const WORKER_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "TERM",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "COMSPEC",
+  "PATHEXT"
+];
+
+/** This package's root, from either `src/worker/` or `dist/worker/`. */
+const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/[\\/]+$/, "");
+
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -65,6 +91,8 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
   drainTimeoutMs: number;
   autoRestart: boolean;
   maxCrashRestarts: number;
+  permissions: boolean;
+  workerEnv: Record<string, string>;
 
   #child: ChildProcess | null = null;
   #ready = false;
@@ -92,7 +120,9 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
     killGraceMs = 1_000,
     drainTimeoutMs = 5_000,
     autoRestart = true,
-    maxCrashRestarts = 5
+    maxCrashRestarts = 5,
+    permissions = false,
+    workerEnv = {}
   }: ToolWorkerClientOptions) {
     super();
     this.config = config;
@@ -101,6 +131,25 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
     this.drainTimeoutMs = drainTimeoutMs;
     this.autoRestart = autoRestart;
     this.maxCrashRestarts = maxCrashRestarts;
+    this.permissions = permissions;
+    this.workerEnv = workerEnv;
+  }
+
+  /**
+   * Node flags for the worker. With `permissions`, Node's permission model confines the whole
+   * process, not just the `ctx` helpers: file access to this package, the tool store, and the
+   * workspace; child processes only when `exec` is enabled. Network is not restricted.
+   */
+  execArgv(): string[] {
+    const flags = ["--disable-warning=ExperimentalWarning"];
+    if (!this.permissions) return flags;
+    const { dir, workspace, capabilities } = this.config;
+    const readable = [PACKAGE_ROOT, dir, workspace].flatMap(withRealPath);
+    const writable = [dir, workspace].flatMap(withRealPath);
+    flags.push("--permission"); // one flag per path: Node no longer accepts comma-separated lists
+    flags.push(...readable.map((p) => `--allow-fs-read=${p}`), ...writable.map((p) => `--allow-fs-write=${p}`));
+    if (capabilities?.exec) flags.push("--allow-child-process");
+    return flags;
   }
 
   status(): WorkerStatus {
@@ -190,8 +239,8 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
 
     const child = fork(WORKER_PATH, [], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
-      execArgv: ["--disable-warning=ExperimentalWarning"],
-      env: { ...process.env, [CONFIG_ENV]: JSON.stringify(this.config) },
+      execArgv: this.execArgv(),
+      env: { ...pick(process.env, WORKER_ENV_KEYS), ...this.workerEnv, [CONFIG_ENV]: JSON.stringify(this.config) },
       // Own process group, so stopping the worker also stops anything a tool spawned.
       detached: USE_PROCESS_GROUPS
     });
@@ -381,6 +430,25 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
 }
 
 function noop(): void {}
+
+function pick(source: NodeJS.ProcessEnv, keys: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    const value = source[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/** A path and, if it differs, its real path, so a symlinked workspace is allowed under both names. */
+function withRealPath(target: string): string[] {
+  try {
+    const real = realpathSync(target);
+    return real === target ? [target] : [target, real];
+  } catch {
+    return [target];
+  }
+}
 
 /** Signal the worker's whole process group where supported, else just the worker. */
 function signal(child: ChildProcess, name: NodeJS.Signals): void {

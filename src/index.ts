@@ -8,6 +8,7 @@ export { ToolError } from "./errors.ts";
 export { coreTools, toAnthropic, toOpenAIResponses, toOpenAIChat } from "./definitions.ts";
 export { unwrapExecuteSource, buildModuleSource, assertModuleSource } from "./validate/source.ts";
 export { normalizeToolSchema } from "./validate/schema.ts";
+export { validateArgs } from "./validate/args.ts";
 export { assertToolName, assertUserToolName, isCoreTool, RESERVED_NAMES, TOOL_NAME_PATTERN } from "./validate/names.ts";
 export { DEFAULT_CAPABILITIES } from "./capabilities.ts";
 export { resolveInside } from "./worker/context.ts";

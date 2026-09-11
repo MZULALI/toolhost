@@ -115,6 +115,20 @@ export interface ToolHostOptions {
   maxSourceBytes?: number;
   /** Receives the worker's stdout, stderr, and warnings (unhandled rejections in tools). Default: discard. */
   onLog?: (entry: LogEntry) => void;
+  /**
+   * Run the worker under Node's permission model: file access limited to this package, `dir`
+   * and `workspace`; child processes only when `capabilities.exec` is on. Network is not
+   * restricted. Default false.
+   */
+  permissions?: boolean;
+  /**
+   * Environment variables for the worker process. The parent's environment is NOT inherited
+   * (only PATH, HOME, locale and temp-dir variables are), so anything a tool needs, such as
+   * an API key for `fetchJson`, is passed here on purpose. Default none.
+   */
+  workerEnv?: Record<string, string>;
+  /** Check a call's arguments against the tool's schema before it reaches the worker. Default true. */
+  validateArgs?: boolean;
 }
 
 /** What the forked worker is told, via an environment variable. */
@@ -135,6 +149,8 @@ export interface ToolWorkerClientOptions {
   drainTimeoutMs?: number;
   autoRestart?: boolean;
   maxCrashRestarts?: number;
+  permissions?: boolean;
+  workerEnv?: Record<string, string>;
 }
 
 export interface ToolWorkerClientEvents {
@@ -188,6 +204,7 @@ export type ToolErrorCode =
   | "invalid_schema"
   | "invalid_source"
   | "invalid_argument"
+  | "invalid_arguments"
   | "invalid_path"
   | "exists"
   | "not_found"

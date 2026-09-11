@@ -16,17 +16,19 @@ model ──my_tool───────▶ host ──IPC──▶ worker proce
 
 ## Not a sandbox
 
-Generated code runs in a child Node process with the same OS user, permissions, and network as the parent. A tool can `import("node:fs")` and read your home directory. The worker isolates faults, not intent: a tool that crashes, hangs, or leaks cannot take your process down, and that is all it promises. If the model talks to untrusted users, run the whole thing in a container or VM.
+Generated code runs in a child Node process with the same OS user and network as the parent. By default a tool can `import("node:fs")` and read your home directory. The worker isolates faults, not intent: a tool that crashes, hangs, or leaks cannot take your process down, and that is all it promises. If the model talks to untrusted users, run the whole thing in a container or VM.
 
-Within that, the `ctx` helpers a tool is given are careful:
+What is enforced regardless:
 
-- `exec` is off unless you enable it, and then sees only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `TERM` plus what you add. Your API keys are not inherited.
-- File helpers resolve real paths and refuse anything outside the workspace, including symlinks that lead out, dangling symlinks, and toolhost's own directory.
+- The worker does not inherit your environment. It gets `PATH`, `HOME`, locale and temp-dir variables, plus whatever you put in `workerEnv`. Your API keys never reach model-written code unless you hand them over.
+- `exec` is off unless you enable it, and then runs with that same minimal environment.
+- The `ctx` file helpers resolve real paths and refuse anything outside the workspace, including symlinks that lead out, dangling symlinks, and toolhost's own directory.
 - Source is parsed before it is saved. A body that closes its function early is rejected, so the module on disk runs no code at import time.
+- Arguments are checked against the tool's schema before a call reaches the worker: type, required, unknown properties, enums, bounds, nested objects and arrays. Mismatches come back as `invalid_arguments` with each problem spelled out.
 - The worker is its own process group, so stopping it also stops what a tool spawned.
 - A tool cannot forge error codes. Anything it throws reaches you as `call_failed` with the original in `details`.
 
-Arguments are not validated against the tool's schema, by toolhost or reliably by providers. Tools check their own input.
+With `permissions: true`, the worker runs under Node's permission model: file access is limited to this package, toolhost's `dir`, and the workspace, and child processes are denied unless `exec` is on. Then `import("node:fs")` outside the workspace fails with `ERR_ACCESS_DENIED`. Network is not restricted by that model, and a double-forked daemon can still outlive the worker, which is why the container advice stands.
 
 ## Install
 
@@ -80,7 +82,7 @@ Every error the model sees is a `ToolError` with a stable `code` and a message w
 
 ## API
 
-`createToolHost(options)` returns a started `ToolHost` with `tools()`, `call(name, args)`, `history(name)`, `status()`, `start()`, `stop()`. Options, error codes, `ctx`, and the lower layers (`ToolRegistry`, `ToolStore`, `ToolWorkerClient`) are documented in [`src/types.ts`](src/types.ts); everything there is exported.
+`createToolHost(options)` returns a started `ToolHost` with `tools()`, `call(name, args)`, `history(name)`, `status()`, `start()`, `stop()`. Options worth knowing: `capabilities`, `permissions`, `workerEnv`, `validateArgs`, `maxResultBytes`, `onLog`. All options, error codes, `ctx`, and the lower layers (`ToolRegistry`, `ToolStore`, `ToolWorkerClient`, `validateArgs`) are documented in [`src/types.ts`](src/types.ts); everything there is exported.
 
 ## Development
 
