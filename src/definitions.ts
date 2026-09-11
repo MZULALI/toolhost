@@ -1,10 +1,15 @@
+import { RESERVED_NAMES } from "./validate/names.ts";
+import type { JsonSchema, ToolDefinition } from "./types.ts";
+
+export { isCoreTool } from "./validate/names.ts";
+
 /**
  * The five tools the model uses to manage its own tools, in a provider-neutral shape:
- * `{ name, description, parameters }` with `parameters` as JSON Schema.
- * Use `toAnthropic`, `toOpenAIResponses` or `toOpenAIChat` to get a provider's exact shape.
+ * `{ name, description, parameters }` with `parameters` as JSON Schema. Use `toAnthropic`,
+ * `toOpenAIResponses` or `toOpenAIChat` to get a provider's exact shape.
  */
 
-function objectSchema(properties, required = Object.keys(properties)) {
+function objectSchema(properties: Record<string, JsonSchema>, required: string[] = Object.keys(properties)): JsonSchema {
   return { type: "object", properties, required, additionalProperties: false };
 }
 
@@ -14,9 +19,7 @@ const CONTEXT_DOCS =
   "and callTool(name, args) to call another generated tool. " +
   "Return a plain JSON value (object, array, string, number, boolean or null); anything else is dropped or rejected.";
 
-import { RESERVED_NAMES } from "./names.js";
-
-export const coreTools = Object.freeze([
+export const coreTools: readonly ToolDefinition[] = Object.freeze([
   {
     name: "create_tool",
     description:
@@ -103,26 +106,38 @@ export const coreTools = Object.freeze([
   }
 ]);
 
-export { isCoreTool } from "./names.js";
+if (coreTools.some((tool, i) => tool.name !== RESERVED_NAMES[i])) {
+  throw new Error("coreTools and RESERVED_NAMES are out of sync.");
+}
 
 /** Anthropic Messages API: `{ name, description, input_schema }`. */
-export function toAnthropic(tools) {
-  return tools.map(({ name, description, parameters }) => ({ name, description, input_schema: parameters }));
-}
-
-/** OpenAI Responses API: `{ type: "function", name, description, parameters }`. */
-export function toOpenAIResponses(tools) {
-  return tools.map(({ name, description, parameters }) => ({ type: "function", name, description, parameters }));
-}
-
-/** OpenAI Chat Completions API: `{ type: "function", function: { name, description, parameters } }`. */
-export function toOpenAIChat(tools) {
+export function toAnthropic(tools: readonly ToolDefinition[]) {
   return tools.map(({ name, description, parameters }) => ({
-    type: "function",
-    function: { name, description, parameters }
+    name,
+    description,
+    input_schema: { ...parameters, type: "object" as const }
   }));
 }
 
-if (coreTools.some((tool, i) => tool.name !== RESERVED_NAMES[i])) {
-  throw new Error("coreTools and RESERVED_NAMES are out of sync.");
+/**
+ * OpenAI Responses API: `{ type: "function", name, description, parameters, strict }`.
+ * `strict` is false because generated schemas may have optional properties, which strict
+ * mode forbids.
+ */
+export function toOpenAIResponses(tools: readonly ToolDefinition[]) {
+  return tools.map(({ name, description, parameters }) => ({
+    type: "function" as const,
+    name,
+    description,
+    parameters,
+    strict: false
+  }));
+}
+
+/** OpenAI Chat Completions API: `{ type: "function", function: { name, description, parameters } }`. */
+export function toOpenAIChat(tools: readonly ToolDefinition[]) {
+  return tools.map(({ name, description, parameters }) => ({
+    type: "function" as const,
+    function: { name, description, parameters }
+  }));
 }

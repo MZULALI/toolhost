@@ -1,12 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { DEFAULT_CAPABILITIES } from "./capabilities.js";
-import { coreTools } from "./definitions.js";
-import { ToolError } from "./errors.js";
-import { assertUserToolName, isCoreTool } from "./names.js";
-import { DEFAULT_MAX_SOURCE_BYTES, ToolRegistry } from "./registry.js";
-import { ToolStore } from "./store.js";
-import { ToolWorkerClient } from "./worker/client.js";
+import { DEFAULT_CAPABILITIES } from "./capabilities.ts";
+import { coreTools } from "./definitions.ts";
+import { ToolError, errorCode, errorMessage } from "./errors.ts";
+import { DEFAULT_MAX_SOURCE_BYTES, ToolRegistry, type HistoryOptions } from "./registry.ts";
+import { ToolStore } from "./storage/store.ts";
+import type { Capabilities, HostStatus, LogEntry, Tool, ToolDefinition, ToolHostOptions, ToolVersion } from "./types.ts";
+import { assertUserToolName, isCoreTool } from "./validate/names.ts";
+import { ToolWorkerClient } from "./worker/client.ts";
+
+/** History rows per `read_tool` call. The model pages with `history_before`. */
+const HISTORY_PAGE = 20;
+
+type Args = Record<string, unknown>;
 
 /**
  * The one object an application talks to.
@@ -20,31 +26,25 @@ import { ToolWorkerClient } from "./worker/client.js";
  * wrapped as `internal_error` rather than leaking a raw stack to the model.
  */
 export class ToolHost {
-  #open = false;
-  #lockPath;
-  #dbPath;
-  #modulesDir;
-  #maxSourceBytes;
-  #onLog;
-  /** Built-in tool calls in progress; stop() waits for them so a late restart cannot outlive it. */
-  #coreCalls = new Set();
+  readonly dir: string;
+  readonly workspace: string;
+  readonly capabilities: Capabilities;
+  readonly callTimeoutMs: number;
+  readonly worker: ToolWorkerClient;
+  /** Available between start() and stop(). */
+  store: ToolStore | null = null;
+  /** Available between start() and stop(). */
+  registry: ToolRegistry | null = null;
 
-  /**
-   * @param {{
-   *   dir: string,
-   *   workspace?: string,
-   *   capabilities?: Partial<typeof DEFAULT_CAPABILITIES>,
-   *   callTimeoutMs?: number,
-   *   readyTimeoutMs?: number,
-   *   killGraceMs?: number,
-   *   drainTimeoutMs?: number,
-   *   autoRestart?: boolean,
-   *   maxCrashRestarts?: number,
-   *   maxResultBytes?: number,
-   *   maxSourceBytes?: number,
-   *   onLog?: (entry: { stream: string, text: string }) => void
-   * }} options
-   */
+  #open = false;
+  readonly #lockPath: string;
+  readonly #dbPath: string;
+  readonly #modulesDir: string;
+  readonly #maxSourceBytes: number;
+  readonly #onLog: (entry: LogEntry) => void;
+  /** Built-in tool calls in progress; stop() waits for them so a late restart cannot outlive it. */
+  readonly #coreCalls = new Set<Promise<unknown>>();
+
   constructor({
     dir,
     workspace = process.cwd(),
@@ -58,7 +58,7 @@ export class ToolHost {
     maxResultBytes = 1_000_000,
     maxSourceBytes = DEFAULT_MAX_SOURCE_BYTES,
     onLog = noop
-  }) {
+  }: ToolHostOptions) {
     if (!dir) throw new ToolError("invalid_argument", "ToolHost requires a `dir` to store its database and modules.");
     assertPositiveInteger({ callTimeoutMs, readyTimeoutMs, killGraceMs, drainTimeoutMs, maxResultBytes, maxSourceBytes });
     assertNonNegativeInteger({ maxCrashRestarts });
@@ -80,10 +80,6 @@ export class ToolHost {
     this.#maxSourceBytes = maxSourceBytes;
     this.#onLog = onLog;
 
-    /** @type {ToolStore | null} */
-    this.store = null;
-    /** @type {ToolRegistry | null} */
-    this.registry = null;
     this.worker = new ToolWorkerClient({
       config: { dir: this.dir, dbPath: this.#dbPath, modulesDir: this.#modulesDir, workspace: this.workspace, capabilities: this.capabilities, maxResultBytes },
       readyTimeoutMs,
@@ -97,7 +93,7 @@ export class ToolHost {
   }
 
   /** Lock the directory, open the store, sync modules, start the worker. Idempotent. */
-  async start() {
+  async start(): Promise<this> {
     if (this.#open) return this;
     try {
       fs.mkdirSync(this.dir, { recursive: true });
@@ -126,12 +122,12 @@ export class ToolHost {
   }
 
   /** Stop the worker, close the database, release the directory. Idempotent; `start()` reopens. */
-  async stop() {
+  async stop(): Promise<void> {
     if (!this.#open) return;
     this.#open = false;
     await Promise.allSettled([...this.#coreCalls]);
     await this.worker.stop("stop");
-    this.store.close();
+    this.store?.close();
     this.store = null;
     this.registry = null;
     releaseLock(this.#lockPath);
@@ -141,20 +137,17 @@ export class ToolHost {
    * Built-in tools plus every enabled generated tool, as `{ name, description, parameters }`.
    * Pass through `toAnthropic` / `toOpenAIResponses` / `toOpenAIChat` for a provider's shape.
    */
-  tools() {
-    this.#assertOpen();
-    return [...coreTools, ...this.registry.definitions()];
+  tools(): ToolDefinition[] {
+    const registry = this.#assertOpen();
+    return [...coreTools, ...registry.definitions()];
   }
 
-  /**
-   * Run a tool the model chose. Rejects with `ToolError`; the message is written for the model.
-   * @param {string} name @param {Record<string, unknown>} [args]
-   */
-  async call(name, args = {}) {
+  /** Run a tool the model chose. Rejects with `ToolError`; the message is written for the model. */
+  async call(name: string, args: Args = {}): Promise<unknown> {
     try {
       this.#assertOpen();
       if (typeof name !== "string") throw new ToolError("invalid_name", "Tool name must be a string.");
-      const input = args && typeof args === "object" ? args : {};
+      const input: Args = args && typeof args === "object" ? args : {};
       if (!isCoreTool(name)) return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
       const pending = this.#callCore(name.toLowerCase(), input);
       this.#coreCalls.add(pending);
@@ -168,21 +161,18 @@ export class ToolHost {
     }
   }
 
-  /**
-   * Previous versions of a tool, newest first. Includes deleted tools.
-   * @param {string} name @param {{ limit?: number, before?: number }} [options]
-   */
-  history(name, { limit = 20, before } = {}) {
+  /** Previous versions of a tool, newest first. Includes deleted tools. `before` pages further back. */
+  history(name: string, { limit = 20, before }: HistoryOptions = {}): ToolVersion[] {
     try {
-      this.#assertOpen();
+      const registry = this.#assertOpen();
       assertPositiveInteger({ limit });
-      return this.registry.history(name, { limit, before: optionalVersionId(before) });
+      return registry.history(name, { limit, before: optionalVersionId(before) });
     } catch (error) {
       throw asToolError(error);
     }
   }
 
-  status() {
+  status(): HostStatus {
     return {
       open: this.#open,
       dir: this.dir,
@@ -192,31 +182,36 @@ export class ToolHost {
     };
   }
 
-  #assertOpen() {
-    if (!this.#open) throw new ToolError("host_stopped", "ToolHost is not started. Call start() first.");
+  #assertOpen(): ToolRegistry {
+    if (!this.#open || !this.registry || !this.store) {
+      throw new ToolError("host_stopped", "ToolHost is not started. Call start() first.");
+    }
+    return this.registry;
   }
 
-  async #callCore(name, args) {
+  async #callCore(name: string, args: Args): Promise<unknown> {
+    const registry = this.#assertOpen();
+    const store = this.store!;
     switch (name) {
       case "create_tool": {
         const tool = await this.#applyThenRestart(
-          `create:${args.name}`,
+          `create:${String(args.name)}`,
           () =>
-            this.registry.create({
-              name: args.name,
-              description: args.description,
-              parameters: args.parameters_json,
-              executeSource: args.execute_source
+            registry.create({
+              name: args.name as string,
+              description: args.description as string,
+              parameters: args.parameters_json as string,
+              executeSource: args.execute_source as string
             }),
-          (created) => this.registry.delete(created.name)
+          (created) => registry.delete(created.name)
         );
         return { ok: true, tool: publicTool(tool) };
       }
       case "update_tool": {
         const toolName = assertUserToolName(args.name);
         const restoreVersion = optionalVersionId(args.restore_version);
-        const before = this.store.get(toolName);
-        const beforeVersion = before ? this.registry.history(toolName)[0] : null;
+        const before = store.get(toolName);
+        const beforeVersion = before ? registry.history(toolName)[0] : null;
         if (!before && restoreVersion === undefined) {
           throw new ToolError(
             "not_found",
@@ -227,44 +222,44 @@ export class ToolHost {
           `update:${toolName}`,
           () =>
             restoreVersion !== undefined
-              ? this.registry.restore(toolName, restoreVersion)
-              : this.registry.update({
+              ? registry.restore(toolName, restoreVersion)
+              : registry.update({
                   name: toolName,
-                  description: args.description,
-                  parameters: args.parameters_json,
-                  executeSource: args.execute_source,
-                  enabled: args.enabled
+                  description: args.description as string | undefined,
+                  parameters: args.parameters_json as string | undefined,
+                  executeSource: args.execute_source as string | undefined,
+                  enabled: args.enabled as boolean | undefined
                 }),
-          () => (before ? this.registry.restore(toolName, beforeVersion.id) : this.registry.delete(toolName))
+          () => (before && beforeVersion ? registry.restore(toolName, beforeVersion.id) : registry.delete(toolName))
         );
         return { ok: true, tool: publicTool(tool) };
       }
       case "delete_tool": {
         const deleted = await this.#applyThenRestart(
-          `delete:${args.name}`,
-          () => this.registry.delete(args.name),
-          (result) => this.registry.restore(result.name, result.versionId)
+          `delete:${String(args.name)}`,
+          () => registry.delete(args.name as string),
+          (result) => registry.restore(result.name, result.versionId)
         );
         return { ok: true, deleted: deleted.name, restore_version: deleted.versionId };
       }
       case "list_tools": {
-        const tools = this.registry.list({ includeDisabled: Boolean(args.include_disabled) });
+        const tools = registry.list({ includeDisabled: Boolean(args.include_disabled) });
         return { ok: true, tools: tools.map((tool) => publicTool(tool)) };
       }
       case "read_tool": {
         const toolName = assertUserToolName(args.name);
         const includeSource = Boolean(args.include_source);
-        const tool = this.store.get(toolName, { includeSource });
-        const result = { ok: true, tool: tool ? publicTool(tool, includeSource) : null };
+        const tool = store.get(toolName, { includeSource });
+        const result: Args = { ok: true, tool: tool ? publicTool(tool, includeSource) : null };
         if (args.include_history) {
           const before = optionalVersionId(args.history_before);
-          const page = this.registry.history(toolName, { limit: HISTORY_PAGE, before });
+          const page = registry.history(toolName, { limit: HISTORY_PAGE, before });
           result.history = page.map((version) => publicVersion(version, includeSource));
           const oldest = page.at(-1);
-          const more = oldest ? this.registry.history(toolName, { limit: 1, before: oldest.id }).length > 0 : false;
+          const more = oldest ? registry.history(toolName, { limit: 1, before: oldest.id }).length > 0 : false;
           result.history_truncated = more;
-          if (more) result.history_next_before = oldest.id;
-          if (!tool && this.registry.historyCount(toolName) === 0) {
+          if (more && oldest) result.history_next_before = oldest.id;
+          if (!tool && registry.historyCount(toolName) === 0) {
             throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
           }
         } else if (!tool) {
@@ -278,36 +273,39 @@ export class ToolHost {
   }
 
   /**
-   * Apply a registry change, then restart the worker so it takes effect. If the restart
-   * fails, undo the change and restart again, so the registry never advertises a tool the
-   * worker cannot run.
+   * Apply a registry change, then restart the worker so it takes effect. If the restart fails,
+   * undo the change and restart again, so the registry never advertises a tool the worker
+   * cannot run.
    */
-  async #applyThenRestart(reason, apply, rollback) {
+  async #applyThenRestart<T>(reason: string, apply: () => Promise<T>, rollback: (value: T) => Promise<unknown>): Promise<T> {
     const value = await apply();
     try {
       await this.worker.restart(reason);
     } catch (error) {
       await rollback(value).catch(noop);
       await this.worker.restart(`rollback:${reason}`).catch(noop);
-      throw new ToolError(
-        "worker_unavailable",
-        `The change was rolled back because the worker could not restart: ${error.message}`,
-        { cause: error.code }
-      );
+      throw new ToolError("worker_unavailable", `The change was rolled back because the worker could not restart: ${errorMessage(error)}`, {
+        cause: errorCode(error)
+      });
     }
     return value;
   }
 }
 
+/** Create and start a host in one call. */
+export async function createToolHost(options: ToolHostOptions): Promise<ToolHost> {
+  return new ToolHost(options).start();
+}
+
 /** `undefined`/`null` mean "not given"; anything else must be a non-negative integer. */
-function optionalVersionId(value) {
+function optionalVersionId(value: unknown): number | undefined {
   if (value === undefined || value === null) return undefined;
-  if (Number.isInteger(value) && value >= 0) return value;
+  if (Number.isInteger(value) && (value as number) >= 0) return value as number;
   throw new ToolError("invalid_argument", `restore_version must be a version id (a non-negative integer), got ${JSON.stringify(value)}.`);
 }
 
 /** Shape returned to the model: never the assembled module, only what it authored. */
-function publicTool(tool, includeSource = false) {
+function publicTool(tool: Tool, includeSource = false) {
   return {
     name: tool.name,
     description: tool.description,
@@ -319,7 +317,7 @@ function publicTool(tool, includeSource = false) {
   };
 }
 
-function publicVersion(version, includeSource) {
+function publicVersion(version: ToolVersion, includeSource: boolean) {
   return {
     version: version.id,
     operation: version.operation,
@@ -330,53 +328,51 @@ function publicVersion(version, includeSource) {
   };
 }
 
-/** History rows per `read_tool` call. The model pages with `history_before`. */
-const HISTORY_PAGE = 20;
-
-function assertPositiveInteger(options) {
+function assertPositiveInteger(options: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(options)) {
-    if (value !== undefined && !(Number.isInteger(value) && value > 0)) {
+    if (value !== undefined && !(Number.isInteger(value) && (value as number) > 0)) {
       throw new ToolError("invalid_argument", `${key} must be a positive integer, got ${JSON.stringify(value)}.`);
     }
   }
 }
 
-function assertNonNegativeInteger(options) {
+function assertNonNegativeInteger(options: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(options)) {
-    if (value !== undefined && !(Number.isInteger(value) && value >= 0)) {
+    if (value !== undefined && !(Number.isInteger(value) && (value as number) >= 0)) {
       throw new ToolError("invalid_argument", `${key} must be a non-negative integer, got ${JSON.stringify(value)}.`);
     }
   }
 }
 
 /** Every rejection from the public surface is a ToolError. */
-function asToolError(error) {
+function asToolError(error: unknown): ToolError {
   if (error instanceof ToolError) return error;
-  if (error?.code === "ERR_SQLITE_ERROR") {
-    return new ToolError("store_error", `The tool store rejected the operation: ${error.message}`, { cause: error });
+  if (errorCode(error) === "ERR_SQLITE_ERROR") {
+    return new ToolError("store_error", `The tool store rejected the operation: ${errorMessage(error)}`, { cause: error });
   }
-  return new ToolError("internal_error", `toolhost failed unexpectedly: ${error?.message ?? error}`, { cause: error });
+  return new ToolError("internal_error", `toolhost failed unexpectedly: ${errorMessage(error)}`, { cause: error });
 }
 
 /** Anything that is not already a ToolError becomes one, with the sentence a misconfiguration needs. */
-function asStartError(error, dir) {
+function asStartError(error: unknown, dir: string): ToolError {
   if (error instanceof ToolError) return error;
-  const detail = error?.code ? `${error.code}: ${error.message}` : String(error?.message ?? error);
+  const code = errorCode(error);
+  const detail = code ? `${code}: ${errorMessage(error)}` : errorMessage(error);
   return new ToolError("start_failed", `ToolHost could not start in ${dir}. ${detail}`, { cause: error });
 }
 
 /**
  * One host per directory. A second host sharing the store would advertise tools its own
- * worker has not loaded. The lock is a file holding the owner's pid; a stale lock from a
- * dead process is reclaimed.
+ * worker has not loaded. The lock is a file holding the owner's pid; a stale lock from a dead
+ * process is reclaimed.
  */
-function acquireLock(lockPath) {
+function acquireLock(lockPath: string): void {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
       return;
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+      if (errorCode(error) !== "EEXIST") throw error;
       const owner = Number(fs.readFileSync(lockPath, "utf8"));
       if (owner === process.pid || isAlive(owner)) {
         throw new ToolError("dir_in_use", `Another ToolHost (pid ${owner}) is using ${path.dirname(lockPath)}. Use one host per dir.`);
@@ -387,7 +383,7 @@ function acquireLock(lockPath) {
   throw new ToolError("dir_in_use", `Could not lock ${path.dirname(lockPath)}.`);
 }
 
-function releaseLock(lockPath) {
+function releaseLock(lockPath: string): void {
   try {
     if (Number(fs.readFileSync(lockPath, "utf8")) === process.pid) fs.rmSync(lockPath, { force: true });
   } catch {
@@ -395,22 +391,14 @@ function releaseLock(lockPath) {
   }
 }
 
-function isAlive(pid) {
+function isAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return error.code === "EPERM";
+    return errorCode(error) === "EPERM";
   }
 }
 
-function noop() {}
-
-/**
- * Create and start a host in one call.
- * @param {ConstructorParameters<typeof ToolHost>[0]} options
- */
-export async function createToolHost(options) {
-  return new ToolHost(options).start();
-}
+function noop(): void {}

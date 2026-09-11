@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 /** A fresh temp directory per test, removed afterwards. */
-export async function withTempDir(fn) {
+export async function withTempDir<T>(fn: (dir: string) => Promise<T> | T): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "toolhost-"));
   try {
     return await fn(dir);

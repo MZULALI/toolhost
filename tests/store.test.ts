@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { ToolStore } from "../src/store.js";
-import { withTempDir } from "./helpers.js";
+import { ToolStore } from "../src/storage/store.ts";
+import { withTempDir } from "./helpers.ts";
 
 const record = (overrides = {}) => ({
   name: "echo",
@@ -36,7 +36,7 @@ test("save, get, list, remove, and history", () =>
 
       const history = store.history("echo");
       assert.deepEqual(
-        history.map((v) => [v.operation, v.executeSource, v.enabled]),
+        history.map((v: any) => [v.operation, v.executeSource, v.enabled]),
         [
           ["delete", "return 2;", false],
           ["update", "return 2;", false],
@@ -60,7 +60,7 @@ test("names are unique ignoring case", () =>
       assert.equal(store.findCollision("ECHO"), "Echo");
       assert.equal(store.findCollision("other"), null);
       assert.equal(store.get("echo"), null, "get is exact");
-      assert.throws(() => store.save(record({ name: "echo" }), "create"), (error) => error.code === "exists");
+      assert.throws(() => store.save(record({ name: "echo" }), "create"), (error: any) => error.code === "exists");
       assert.equal(store.get("Echo").updatedAt, store.get("Echo").createdAt, "the colliding save touched nothing");
     } finally {
       store.close();

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeToolSchema } from "../src/schema.js";
+import { normalizeToolSchema as normalize } from "../src/validate/schema.ts";
+
+const normalizeToolSchema = (input: unknown): any => normalize(input);
 
 test("object schemas get strict defaults and required is filtered to real properties", () => {
   const schema = normalizeToolSchema({
@@ -29,21 +31,21 @@ test("array forms of items and prefixItems are normalised too", () => {
 
 test("accepts a JSON string and rejects non-object schemas", () => {
   assert.equal(normalizeToolSchema('{"type":"object"}').type, "object");
-  assert.throws(() => normalizeToolSchema("{not json"), (error) => error.code === "invalid_schema");
-  assert.throws(() => normalizeToolSchema({ type: "string" }), (error) => error.code === "invalid_schema");
-  assert.throws(() => normalizeToolSchema([]), (error) => error.code === "invalid_schema");
+  assert.throws(() => normalizeToolSchema("{not json"), (error: any) => error.code === "invalid_schema");
+  assert.throws(() => normalizeToolSchema({ type: "string" }), (error: any) => error.code === "invalid_schema");
+  assert.throws(() => normalizeToolSchema([]), (error: any) => error.code === "invalid_schema");
 });
 
 test("cycles, absurd depth, and non-JSON values are invalid_schema, never a raw error", () => {
-  const cyclic = { type: "object", properties: {} };
+  const cyclic: any = { type: "object", properties: {} };
   cyclic.properties.self = cyclic;
-  assert.throws(() => normalizeToolSchema(cyclic), (error) => error.code === "invalid_schema" && /cycle/.test(error.message));
+  assert.throws(() => normalizeToolSchema(cyclic), (error: any) => error.code === "invalid_schema" && /cycle/.test(error.message));
 
-  let deep = { type: "object" };
+  let deep: any = { type: "object" };
   for (let i = 0; i < 2000; i += 1) deep = { type: "object", properties: { d: deep } };
-  assert.throws(() => normalizeToolSchema(deep), (error) => error.code === "invalid_schema" && /levels deep/.test(error.message));
+  assert.throws(() => normalizeToolSchema(deep), (error: any) => error.code === "invalid_schema" && /levels deep/.test(error.message));
 
-  assert.throws(() => normalizeToolSchema({ type: "object", properties: { f: { fn: () => 1 } } }), (error) => error.code === "invalid_schema");
+  assert.throws(() => normalizeToolSchema({ type: "object", properties: { f: { fn: () => 1 } } }), (error: any) => error.code === "invalid_schema");
 });
 
 test("a subschema shared in two places is not a cycle", () => {
@@ -60,7 +62,7 @@ test("does not mutate its input", () => {
 });
 
 test("a densely shared schema graph normalises in linear time", () => {
-  let node = { type: "object", properties: { leaf: { type: "string" } } };
+  let node: any = { type: "object", properties: { leaf: { type: "string" } } };
   for (let i = 0; i < 40; i += 1) node = { type: "object", properties: { a: node, b: node } };
   const started = Date.now();
   const schema = normalizeToolSchema(node);

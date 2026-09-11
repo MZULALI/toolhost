@@ -1,23 +1,22 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { ToolStore } from "./store.ts";
 
 /**
  * Module files on disk mirror the store. They exist so the worker can `import()` them and
  * so a human can open them; the store wins whenever the two disagree.
  */
 
-/** @param {string} modulesDir @param {string} name */
-export function modulePath(modulesDir, name) {
+export function modulePath(modulesDir: string, name: string): string {
   return path.join(modulesDir, `${name}.mjs`);
 }
 
 /**
  * Write atomically (temp file + rename) so a worker starting mid-write never imports a
  * half-written module.
- * @param {string} modulesDir @param {{ name: string, moduleSource: string }} tool
  */
-export async function writeModule(modulesDir, tool) {
+export async function writeModule(modulesDir: string, tool: { name: string; moduleSource: string }): Promise<string> {
   await fs.mkdir(modulesDir, { recursive: true });
   const target = modulePath(modulesDir, tool.name);
   const temp = `${target}.${randomUUID()}.tmp`; // unique even for same-tool writes in one tick
@@ -26,21 +25,16 @@ export async function writeModule(modulesDir, tool) {
   return target;
 }
 
-/** @param {string} modulesDir @param {string} name */
-export async function removeModule(modulesDir, name) {
+export async function removeModule(modulesDir: string, name: string): Promise<void> {
   await fs.rm(modulePath(modulesDir, name), { force: true });
 }
 
-/**
- * Write every stored tool's module and delete any `.mjs` the store does not know about.
- * @param {import("./store.js").ToolStore} store
- * @param {string} modulesDir
- */
-export async function syncModules(store, modulesDir) {
+/** Write every stored tool's module and delete any `.mjs` the store does not know about. */
+export async function syncModules(store: ToolStore, modulesDir: string): Promise<void> {
   await fs.mkdir(modulesDir, { recursive: true });
   const tools = store.list({ includeSource: true });
   const expected = new Set(tools.map((tool) => path.basename(modulePath(modulesDir, tool.name))));
-  await Promise.all(tools.map((tool) => writeModule(modulesDir, tool)));
+  await Promise.all(tools.map((tool) => writeModule(modulesDir, { name: tool.name, moduleSource: tool.moduleSource! })));
 
   const entries = await fs.readdir(modulesDir, { withFileTypes: true });
   const stale = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".mjs") && !expected.has(entry.name));

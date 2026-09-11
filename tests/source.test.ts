@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assertModuleSource, buildModuleSource, unwrapExecuteSource } from "../src/source.js";
+import { assertModuleSource, buildModuleSource, unwrapExecuteSource } from "../src/validate/source.ts";
 
 test("a plain body is returned as-is", () => {
   assert.equal(unwrapExecuteSource("return args.value;"), "return args.value;");
@@ -45,7 +45,7 @@ test("a body that closes the function early is rejected, whatever the stub is na
   ]) {
     assert.throws(
       () => unwrapExecuteSource(source),
-      (error) => error.code === "invalid_source" && /closes the function early/.test(error.message),
+      (error: any) => error.code === "invalid_source" && /closes the function early/.test(error.message),
       source
     );
   }
@@ -63,13 +63,13 @@ test("the body is stored verbatim: multi-line templates and line continuations s
 test("a syntax error reports the line inside the body", () => {
   assert.throws(
     () => unwrapExecuteSource("const a = 1;\nconst b = ;\nreturn a;"),
-    (error) => error.code === "invalid_source" && error.details.line === 2 && /Syntax error/.test(error.message)
+    (error: any) => error.code === "invalid_source" && error.details.line === 2 && /Syntax error/.test(error.message)
   );
 });
 
 test("empty source is rejected", () => {
-  assert.throws(() => unwrapExecuteSource("   "), (error) => error.code === "invalid_source");
-  assert.throws(() => unwrapExecuteSource(undefined), (error) => error.code === "invalid_source");
+  assert.throws(() => unwrapExecuteSource("   "), (error: any) => error.code === "invalid_source");
+  assert.throws(() => unwrapExecuteSource(undefined), (error: any) => error.code === "invalid_source");
 });
 
 test("the assembled module has exactly the expected exports", () => {
@@ -82,5 +82,5 @@ test("the assembled module has exactly the expected exports", () => {
   assert.doesNotThrow(() => assertModuleSource(moduleSource));
   assert.match(moduleSource, /export const definition = \{/);
   assert.match(moduleSource, /export async function execute\(args, ctx\) \{\nreturn args;\n\}/);
-  assert.throws(() => assertModuleSource(moduleSource + "\nconsole.log(1);"), (error) => error.code === "invalid_source");
+  assert.throws(() => assertModuleSource(moduleSource + "\nconsole.log(1);"), (error: any) => error.code === "invalid_source");
 });

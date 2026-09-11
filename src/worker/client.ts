@@ -1,12 +1,17 @@
-import { fork } from "node:child_process";
+import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { ToolError } from "../errors.js";
-import { CONFIG_ENV, READY, RESULT, STARTUP_ERROR, WARNING } from "../protocol.js";
+import { ToolError } from "../errors.ts";
+import type { SerializedError, ToolWorkerClientEvents, ToolWorkerClientOptions, WorkerConfig, WorkerExit, WorkerStatus } from "../types.ts";
+import { CONFIG_ENV, READY, RESULT, STARTUP_ERROR, WARNING, type WorkerMessage } from "./protocol.ts";
 
-const WORKER_PATH = fileURLToPath(new URL("./main.js", import.meta.url));
+/** Same directory, same extension as this file: `.ts` when run from source, `.js` from `dist/`. */
+const WORKER_PATH = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./main.ts" : "./main.js", import.meta.url));
+
+/** Startup failures the worker may name; anything else (a raw errno) is `startup_failed`. */
+const STARTUP_CODES = new Set(["store_incompatible", "invalid_source"]);
 
 /**
  * Codes the worker is allowed to assert. Anything else a tool throws, including a forged
@@ -14,9 +19,6 @@ const WORKER_PATH = fileURLToPath(new URL("./main.js", import.meta.url));
  * `details.remoteCode`, so an application's `switch (error.code)` cannot be steered by
  * model-written code.
  */
-/** Startup failures the worker may name; anything else (a raw errno) is `startup_failed`. */
-const STARTUP_CODES = new Set(["store_incompatible", "invalid_source"]);
-
 const WORKER_CODES = new Set([
   "not_found",
   "invalid_name",
@@ -38,6 +40,14 @@ const WORKER_CODES = new Set([
 /** A worker that stays ready this long has recovered; the crash counter resets. */
 const HEALTHY_AFTER_MS = 30_000;
 
+const USE_PROCESS_GROUPS = process.platform !== "win32";
+
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
 /**
  * Owns the worker child process.
  *
@@ -45,43 +55,37 @@ const HEALTHY_AFTER_MS = 30_000;
  *   drain before replacing the worker, so a tool change never kills a running call.
  * - Calls made while a restart is in progress wait for it instead of failing.
  * - If the worker dies unexpectedly, every in-flight call is rejected and a new worker is
- *   forked with exponential backoff. After `maxCrashRestarts` consecutive crashes it
- *   gives up and emits "unhealthy".
- *
- * Events: "ready" (status), "exit" ({ code, signal, reason, at }), "log" ({ stream, text }),
- * "warning" ({ kind, error }), "restarting" ({ attempt, delayMs }), "unhealthy" ({ crashes, lastExit }).
+ *   forked with exponential backoff. After `maxCrashRestarts` consecutive crashes it gives up
+ *   and emits "unhealthy".
  */
-export class ToolWorkerClient extends EventEmitter {
-  #child = null;
+export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
+  readonly config: WorkerConfig;
+  readyTimeoutMs: number;
+  killGraceMs: number;
+  drainTimeoutMs: number;
+  autoRestart: boolean;
+  maxCrashRestarts: number;
+
+  #child: ChildProcess | null = null;
   #ready = false;
-  #tools = [];
-  #pending = new Map();
+  #tools: string[] = [];
+  #pending = new Map<string, Pending>();
   #restarting = false;
   /** Bumped by stop(); a restart queued before a stop must not fork after it. */
   #stopGeneration = 0;
   #restartCount = 0;
   #crashes = 0;
-  #lastExit = null;
+  #lastExit: WorkerExit | null = null;
   #stopped = true;
-  #queue = Promise.resolve();
-  #scheduled = null;
-  #crashTimer = null;
-  #crashWait = null;
-  #healthyTimer = null;
-  #stopReasons = new WeakMap();
+  #queue: Promise<void> = Promise.resolve();
+  #scheduled: Promise<WorkerStatus> | null = null;
+  #crashTimer: NodeJS.Timeout | null = null;
+  #crashWait: { promise: Promise<void>; release: () => void } | null = null;
+  #healthyTimer: NodeJS.Timeout | null = null;
+  #stopReasons = new WeakMap<ChildProcess, string>();
   /** The child whose startup restart() is currently awaiting; its death is reported by restart(), not supervised. */
-  #starting = null;
+  #starting: ChildProcess | null = null;
 
-  /**
-   * @param {{
-   *   config: { dbPath: string, modulesDir: string, workspace: string, capabilities?: object, maxResultBytes?: number },
-   *   readyTimeoutMs?: number,
-   *   killGraceMs?: number,
-   *   drainTimeoutMs?: number,
-   *   autoRestart?: boolean,
-   *   maxCrashRestarts?: number
-   * }} options
-   */
   constructor({
     config,
     readyTimeoutMs = 5_000,
@@ -89,7 +93,7 @@ export class ToolWorkerClient extends EventEmitter {
     drainTimeoutMs = 5_000,
     autoRestart = true,
     maxCrashRestarts = 5
-  }) {
+  }: ToolWorkerClientOptions) {
     super();
     this.config = config;
     this.readyTimeoutMs = readyTimeoutMs;
@@ -99,7 +103,7 @@ export class ToolWorkerClient extends EventEmitter {
     this.maxCrashRestarts = maxCrashRestarts;
   }
 
-  status() {
+  status(): WorkerStatus {
     return {
       pid: this.#child?.pid ?? null,
       ready: this.#ready,
@@ -114,7 +118,7 @@ export class ToolWorkerClient extends EventEmitter {
    * Replace the worker with a fresh one. Concurrent callers share one restart; a caller that
    * arrives after a restart has begun gets the next one. Resolves once the new worker is ready.
    */
-  restart(reason = "manual") {
+  restart(reason = "manual"): Promise<WorkerStatus> {
     if (this.#scheduled) return this.#scheduled;
     const generation = this.#stopGeneration;
     const task = this.#queue.then(() => {
@@ -133,7 +137,7 @@ export class ToolWorkerClient extends EventEmitter {
    * Terminate the worker and stop supervising it. Waits up to `drainTimeoutMs` for in-flight
    * calls, like `restart()`. `restart()` starts it again.
    */
-  async stop(reason = "stop") {
+  async stop(reason = "stop"): Promise<void> {
     this.#stopped = true;
     this.#stopGeneration += 1;
     this.#cancelCrashRestart();
@@ -142,10 +146,7 @@ export class ToolWorkerClient extends EventEmitter {
     await this.#stopChild(reason);
   }
 
-  /**
-   * @param {string} name @param {unknown} args @param {{ timeoutMs?: number }} [options]
-   */
-  async callTool(name, args, { timeoutMs = 30_000 } = {}) {
+  async callTool(name: string, args: unknown, { timeoutMs = 30_000 }: { timeoutMs?: number } = {}): Promise<unknown> {
     // Only await when there is something to wait for, so in the common case the call is
     // registered synchronously and a stop()/restart() issued in the same tick drains it.
     if (this.#crashWait) await this.#crashWait.promise;
@@ -172,7 +173,7 @@ export class ToolWorkerClient extends EventEmitter {
 
   // -- lifecycle -------------------------------------------------------------------------
 
-  async #restartNow(reason) {
+  async #restartNow(reason: string): Promise<WorkerStatus> {
     this.#restarting = true;
     try {
       return await this.#doRestart(reason);
@@ -181,7 +182,7 @@ export class ToolWorkerClient extends EventEmitter {
     }
   }
 
-  async #doRestart(reason) {
+  async #doRestart(reason: string): Promise<WorkerStatus> {
     this.#stopped = false;
     await this.#drain();
     await this.#stopChild(`restart:${reason}`);
@@ -197,10 +198,10 @@ export class ToolWorkerClient extends EventEmitter {
     this.#child = child;
     this.#starting = child;
 
-    child.stdout.on("data", (chunk) => this.emit("log", { stream: "stdout", text: String(chunk) }));
-    child.stderr.on("data", (chunk) => this.emit("log", { stream: "stderr", text: String(chunk) }));
+    child.stdout!.on("data", (chunk) => this.emit("log", { stream: "stdout", text: String(chunk) }));
+    child.stderr!.on("data", (chunk) => this.emit("log", { stream: "stderr", text: String(chunk) }));
     child.on("message", (message) => {
-      if (this.#child === child) this.#onMessage(message);
+      if (this.#child === child) this.#onMessage(message as WorkerMessage);
     });
     child.on("error", (error) => {
       if (this.#child === child) this.#failAll(new ToolError("worker_unavailable", `Worker error: ${error.message}`));
@@ -215,9 +216,9 @@ export class ToolWorkerClient extends EventEmitter {
     return this.status();
   }
 
-  #onExit(child, code, signal) {
+  #onExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
     const deliberate = this.#stopReasons.has(child);
-    const exit = {
+    const exit: WorkerExit = {
       code,
       signal,
       reason: this.#stopReasons.get(child) ?? "crash",
@@ -231,14 +232,12 @@ export class ToolWorkerClient extends EventEmitter {
     this.#child = null;
     this.#ready = false;
     this.#tools = [];
-    clearTimeout(this.#healthyTimer);
-    this.#failAll(
-      new ToolError("worker_unavailable", `Worker exited unexpectedly (${signal ?? `code ${code}`}) before the call completed.`)
-    );
+    if (this.#healthyTimer) clearTimeout(this.#healthyTimer);
+    this.#failAll(new ToolError("worker_unavailable", `Worker exited unexpectedly (${signal ?? `code ${code}`}) before the call completed.`));
     this.#supervise();
   }
 
-  #supervise() {
+  #supervise(): void {
     if (!this.autoRestart || this.#stopped) return;
     this.#crashes += 1;
     if (this.#crashes > this.maxCrashRestarts) {
@@ -247,8 +246,8 @@ export class ToolWorkerClient extends EventEmitter {
     }
     const delayMs = Math.min(100 * 2 ** (this.#crashes - 1), 5_000);
     this.emit("restarting", { attempt: this.#crashes, delayMs });
-    let release;
-    this.#crashWait = { promise: new Promise((resolve) => (release = resolve)), release };
+    let release: () => void = noop;
+    this.#crashWait = { promise: new Promise<void>((resolve) => (release = resolve)), release };
     // Not unref'd: a scheduled restart is real work and must keep the process alive.
     this.#crashTimer = setTimeout(() => {
       this.restart("crash")
@@ -257,24 +256,24 @@ export class ToolWorkerClient extends EventEmitter {
     }, delayMs);
   }
 
-  #cancelCrashRestart() {
-    clearTimeout(this.#crashTimer);
+  #cancelCrashRestart(): void {
+    if (this.#crashTimer) clearTimeout(this.#crashTimer);
     this.#crashTimer = null;
     this.#crashWait?.release();
     this.#crashWait = null;
   }
 
-  async #stopChild(reason) {
+  async #stopChild(reason: string): Promise<void> {
     const child = this.#child;
     if (!child) return;
     this.#child = null;
     this.#ready = false;
     this.#tools = [];
-    clearTimeout(this.#healthyTimer);
+    if (this.#healthyTimer) clearTimeout(this.#healthyTimer);
     this.#stopReasons.set(child, reason);
 
     if (child.exitCode === null && child.signalCode === null) {
-      await new Promise((resolve) => {
+      await new Promise<void>((resolve) => {
         const timer = setTimeout(() => signal(child, "SIGKILL"), this.killGraceMs);
         child.once("exit", () => {
           clearTimeout(timer);
@@ -287,14 +286,14 @@ export class ToolWorkerClient extends EventEmitter {
   }
 
   /** Wait for in-flight calls to finish, up to `drainTimeoutMs`. */
-  async #drain() {
+  async #drain(): Promise<void> {
     const deadline = Date.now() + this.drainTimeoutMs;
     while (this.#pending.size > 0 && Date.now() < deadline) await sleep(10);
   }
 
-  #waitUntilReady(child) {
+  #waitUntilReady(child: ChildProcess): Promise<void> {
     return new Promise((resolve, reject) => {
-      const fail = (reason, error) => {
+      const fail = (reason: string, error: ToolError) => {
         cleanup();
         this.#stopChild(reason).then(() => reject(error));
       };
@@ -306,9 +305,9 @@ export class ToolWorkerClient extends EventEmitter {
         cleanup();
         resolve();
       };
-      const onStartupError = (error) => {
+      const onStartupError = (error: SerializedError) => {
         const remoteCode = error?.code;
-        const code = STARTUP_CODES.has(remoteCode) ? remoteCode : "startup_failed";
+        const code = remoteCode && STARTUP_CODES.has(remoteCode) ? remoteCode : "startup_failed";
         const message = code === remoteCode ? error.message : `Worker failed to start (${remoteCode ?? "unknown error"}).`;
         fail("startup-error", new ToolError(code, message, { remoteCode, remoteMessage: error?.message }));
       };
@@ -330,7 +329,7 @@ export class ToolWorkerClient extends EventEmitter {
 
   // -- messages --------------------------------------------------------------------------
 
-  #onMessage(message) {
+  #onMessage(message: WorkerMessage): void {
     if (!message || typeof message !== "object") return;
     switch (message.type) {
       case READY:
@@ -353,14 +352,16 @@ export class ToolWorkerClient extends EventEmitter {
         if (!pending) return;
         this.#pending.delete(message.id);
         clearTimeout(pending.timer);
-        if (message.ok) pending.resolve(JSON.parse(message.resultJson));
-        else {
-          const remoteCode = message.error?.code;
-          const code = WORKER_CODES.has(remoteCode) ? remoteCode : "call_failed";
+        if (message.ok) {
+          pending.resolve(JSON.parse(message.resultJson));
+        } else {
+          const failure = message as Extract<WorkerMessage, { ok: false }>;
+          const remoteCode = failure.error?.code;
+          const code = remoteCode && WORKER_CODES.has(remoteCode) ? remoteCode : "call_failed";
           pending.reject(
-            new ToolError(code, message.error?.message ?? "Tool call failed.", {
+            new ToolError(code, failure.error?.message ?? "Tool call failed.", {
               remoteCode: code === remoteCode ? undefined : remoteCode,
-              remoteStack: message.error?.stack
+              remoteStack: failure.error?.stack
             })
           );
         }
@@ -370,7 +371,7 @@ export class ToolWorkerClient extends EventEmitter {
     }
   }
 
-  #failAll(error) {
+  #failAll(error: ToolError): void {
     for (const { reject, timer } of this.#pending.values()) {
       clearTimeout(timer);
       reject(error);
@@ -379,13 +380,11 @@ export class ToolWorkerClient extends EventEmitter {
   }
 }
 
-function noop() {}
-
-const USE_PROCESS_GROUPS = process.platform !== "win32";
+function noop(): void {}
 
 /** Signal the worker's whole process group where supported, else just the worker. */
-function signal(child, name) {
-  if (USE_PROCESS_GROUPS) {
+function signal(child: ChildProcess, name: NodeJS.Signals): void {
+  if (USE_PROCESS_GROUPS && child.pid) {
     try {
       process.kill(-child.pid, name);
       return;
@@ -395,3 +394,4 @@ function signal(child, name) {
   }
   child.kill(name);
 }
+

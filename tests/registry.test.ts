@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { ToolRegistry } from "../src/registry.js";
-import { ToolStore } from "../src/store.js";
-import { echoSchema, withTempDir } from "./helpers.js";
+import { ToolRegistry } from "../src/registry.ts";
+import { ToolStore } from "../src/storage/store.ts";
+import { echoSchema, withTempDir } from "./helpers.ts";
 
-async function setup(dir) {
+async function setup(dir: string) {
   const store = new ToolStore(path.join(dir, "t.sqlite"));
   const registry = new ToolRegistry({ store, modulesDir: path.join(dir, "modules") });
   await registry.init();
@@ -38,7 +38,7 @@ test("create writes the store and a module file; update and delete keep them in 
       await registry.delete("echo");
       await assert.rejects(fs.access(file));
       assert.deepEqual(
-        registry.history("echo").map((v) => [v.operation, v.enabled]),
+        registry.history("echo").map((v: any) => [v.operation, v.enabled]),
         [["delete", false], ["update", false], ["update", true], ["create", true]]
       );
     } finally {
@@ -61,11 +61,11 @@ test("validation failures name what to fix and never touch the store", () =>
         [{ ...good, name: "ok", executeSource: "} globalThis.escaped = 1; function f() {" }, "invalid_source"]
       ];
       for (const [input, code] of cases) {
-        await assert.rejects(registry.create(input), (error) => error.code === code, JSON.stringify(input));
+        await assert.rejects(registry.create(input as any), (error: any) => error.code === code, JSON.stringify(input));
       }
       assert.equal(store.list().length, 0);
-      await assert.rejects(registry.update({ name: "nope" }), (error) => error.code === "not_found");
-      await assert.rejects(registry.delete("nope"), (error) => error.code === "not_found");
+      await assert.rejects(registry.update({ name: "nope" }), (error: any) => error.code === "not_found");
+      await assert.rejects(registry.delete("nope"), (error: any) => error.code === "not_found");
     } finally {
       store.close();
     }

@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { resolveInside } from "../src/worker/context.js";
-import { withTempDir } from "./helpers.js";
+import { resolveInside } from "../src/worker/context.ts";
+import { withTempDir } from "./helpers.ts";
 
 test("resolveInside accepts paths inside the workspace, existing or not", () =>
   withTempDir(async (dir) => {
@@ -21,10 +21,10 @@ test("resolveInside rejects lexical escapes and bad input", () =>
     const ws = path.join(dir, "ws");
     await fs.mkdir(ws);
     for (const bad of ["..", "../x", "sub/../../x", "/etc/passwd", "....//x/../../../y"]) {
-      await assert.rejects(resolveInside(ws, bad), (error) => error.code === "path_outside_workspace", bad);
+      await assert.rejects(resolveInside(ws, bad), (error: any) => error.code === "path_outside_workspace", bad);
     }
-    await assert.rejects(resolveInside(ws, "a\0b"), (error) => error.code === "invalid_path");
-    await assert.rejects(resolveInside(ws, 42), (error) => error.code === "invalid_path");
+    await assert.rejects(resolveInside(ws, "a\0b"), (error: any) => error.code === "invalid_path");
+    await assert.rejects(resolveInside(ws, 42), (error: any) => error.code === "invalid_path");
   }));
 
 test("resolveInside follows symlinks and rejects ones that lead out", () =>
@@ -38,9 +38,9 @@ test("resolveInside follows symlinks and rejects ones that lead out", () =>
     await fs.symlink(path.join(outside, "secret.txt"), path.join(ws, "file-link"));
     await fs.symlink(path.join(ws, "in"), path.join(ws, "in-link"));
 
-    await assert.rejects(resolveInside(ws, "link/secret.txt"), (error) => error.code === "path_outside_workspace");
-    await assert.rejects(resolveInside(ws, "link/new-file.txt"), (error) => error.code === "path_outside_workspace", "writes through a link are rejected too");
-    await assert.rejects(resolveInside(ws, "file-link"), (error) => error.code === "path_outside_workspace");
+    await assert.rejects(resolveInside(ws, "link/secret.txt"), (error: any) => error.code === "path_outside_workspace");
+    await assert.rejects(resolveInside(ws, "link/new-file.txt"), (error: any) => error.code === "path_outside_workspace", "writes through a link are rejected too");
+    await assert.rejects(resolveInside(ws, "file-link"), (error: any) => error.code === "path_outside_workspace");
     assert.equal(await resolveInside(ws, "in-link/x.txt"), path.join(await fs.realpath(ws), "in", "x.txt"), "links that stay inside are fine");
   }));
 
@@ -52,10 +52,10 @@ test("resolveInside rejects dangling symlinks, so a write cannot create a file e
     await fs.mkdir(outside);
     await fs.symlink(path.join(outside, "planted.txt"), path.join(ws, "dangling"));
     await fs.symlink(path.join(outside, "missing-dir"), path.join(ws, "dangling-dir"));
-    await assert.rejects(resolveInside(ws, "dangling"), (error) => error.code === "path_outside_workspace");
-    await assert.rejects(resolveInside(ws, "dangling-dir/child.txt"), (error) => error.code === "path_outside_workspace");
+    await assert.rejects(resolveInside(ws, "dangling"), (error: any) => error.code === "path_outside_workspace");
+    await assert.rejects(resolveInside(ws, "dangling-dir/child.txt"), (error: any) => error.code === "path_outside_workspace");
     await fs.symlink(path.join(ws, "not-yet"), path.join(ws, "dangling-inside"));
-    await assert.rejects(resolveInside(ws, "dangling-inside"), (error) => error.code === "path_outside_workspace", "even an inside-pointing dangling link is refused: its target is not checkable");
+    await assert.rejects(resolveInside(ws, "dangling-inside"), (error: any) => error.code === "path_outside_workspace", "even an inside-pointing dangling link is refused: its target is not checkable");
   }));
 
 test("resolveInside works when the workspace itself is a symlink", () =>
