@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="506" viewBox="0 0 820 506" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+<rect width="820" height="506" rx="8" fill="#0d1117"/>
+<circle cx="22" cy="20" r="6" fill="#ff5f56"/><circle cx="42" cy="20" r="6" fill="#ffbd2e"/><circle cx="62" cy="20" r="6" fill="#27c93f"/>
+<text x="410" y="24" text-anchor="middle" fill="#8b949e" font-size="12">toolhost</text>
+<text x="18" y="70" fill="#c9d1d9" opacity="0" xml:space="preserve">$ node examples/offline.ts<animate attributeName="opacity" from="0" to="1" begin="0.00s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="92" fill="#c9d1d9" opacity="0" xml:space="preserve"><animate attributeName="opacity" from="0" to="1" begin="0.32s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="114" fill="#79c0ff" opacity="0" xml:space="preserve">create_tool  word_count   execute_source: "const words = args.text.trim().split(/\s+/);<animate attributeName="opacity" from="0" to="1" begin="0.64s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="136" fill="#79c0ff" opacity="0" xml:space="preserve">                                          return { words: words.length"<animate attributeName="opacity" from="0" to="1" begin="0.96s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="158" fill="#ff7b72" opacity="0" xml:space="preserve">  ✗ invalid_source: Syntax error in execute_source (line 2):<animate attributeName="opacity" from="0" to="1" begin="1.28s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="180" fill="#ff7b72" opacity="0" xml:space="preserve">    Unexpected end of execute_source (an unclosed brace, bracket or parenthesis?)<animate attributeName="opacity" from="0" to="1" begin="1.60s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="202" fill="#c9d1d9" opacity="0" xml:space="preserve"><animate attributeName="opacity" from="0" to="1" begin="1.92s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="224" fill="#79c0ff" opacity="0" xml:space="preserve">create_tool  word_count   execute_source: "...return { words: words.length };"<animate attributeName="opacity" from="0" to="1" begin="2.24s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="246" fill="#7ee787" opacity="0" xml:space="preserve">  ✓ saved, worker restarted<animate attributeName="opacity" from="0" to="1" begin="2.56s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="268" fill="#79c0ff" opacity="0" xml:space="preserve">word_count   { text: "one two three" }<animate attributeName="opacity" from="0" to="1" begin="2.88s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="290" fill="#7ee787" opacity="0" xml:space="preserve">  → { words: 3 }<animate attributeName="opacity" from="0" to="1" begin="3.20s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="312" fill="#c9d1d9" opacity="0" xml:space="preserve"><animate attributeName="opacity" from="0" to="1" begin="3.52s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="334" fill="#79c0ff" opacity="0" xml:space="preserve">update_tool  word_count   execute_source: "return { words: -1 };"<animate attributeName="opacity" from="0" to="1" begin="3.84s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="356" fill="#79c0ff" opacity="0" xml:space="preserve">word_count   { text: "one two three" }<animate attributeName="opacity" from="0" to="1" begin="4.16s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="378" fill="#7ee787" opacity="0" xml:space="preserve">  → { words: -1 }<animate attributeName="opacity" from="0" to="1" begin="4.48s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="400" fill="#79c0ff" opacity="0" xml:space="preserve">read_tool    word_count   include_history: true<animate attributeName="opacity" from="0" to="1" begin="4.80s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="422" fill="#7ee787" opacity="0" xml:space="preserve">  → history: [ update #3, create #2 ]<animate attributeName="opacity" from="0" to="1" begin="5.12s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="444" fill="#79c0ff" opacity="0" xml:space="preserve">update_tool  word_count   restore_version: 2<animate attributeName="opacity" from="0" to="1" begin="5.44s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="466" fill="#79c0ff" opacity="0" xml:space="preserve">word_count   { text: "one two three" }<animate attributeName="opacity" from="0" to="1" begin="5.76s" dur="0.15s" fill="freeze"/></text>
+<text x="18" y="488" fill="#7ee787" opacity="0" xml:space="preserve">  → { words: 3 }<animate attributeName="opacity" from="0" to="1" begin="6.08s" dur="0.15s" fill="freeze"/></text>
+<rect x="18" y="498" width="8" height="15" fill="#c9d1d9" opacity="0"><animate attributeName="opacity" values="0;0;1;0;1;0;1" keyTimes="0;0.6;0.7;0.8;0.9;0.95;1" begin="6.80s" dur="2s" fill="freeze"/></rect>
+</svg>

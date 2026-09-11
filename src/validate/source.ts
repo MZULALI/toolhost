@@ -131,10 +131,17 @@ function parseOrThrow(source: string, lineOffset: number): acorn.Program {
     return acorn.parse(source, PARSE_OPTIONS);
   } catch (error) {
     const loc = (error as { loc?: { line: number; column: number } }).loc;
-    const line = loc ? loc.line - lineOffset : undefined;
-    const column = loc ? loc.column + 1 : undefined;
-    const where = line === undefined ? "" : ` (line ${line}, column ${column})`;
-    const message = (error as Error).message.replace(/\s*\(\d+:\d+\)$/, "");
+    const bodyLines = source.split("\n").length - (lineOffset ? 3 : 0); // header, footer, trailing newline
+    let line = loc ? loc.line - lineOffset : undefined;
+    let column = loc ? loc.column + 1 : undefined;
+    let message = (error as Error).message.replace(/\s*\(\d+:\d+\)$/, "");
+    // An error past the last body line means the body ended mid-expression; point at its end.
+    if (line !== undefined && lineOffset && line > bodyLines) {
+      line = bodyLines;
+      column = undefined;
+      message = "Unexpected end of execute_source (an unclosed brace, bracket or parenthesis?)";
+    }
+    const where = line === undefined ? "" : column === undefined ? ` (line ${line})` : ` (line ${line}, column ${column})`;
     throw new ToolError("invalid_source", `Syntax error in execute_source${where}: ${message}`, { line, column });
   }
 }
