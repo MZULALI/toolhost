@@ -16,7 +16,9 @@ model ──my_tool───────▶ host ──IPC──▶ worker proce
 
 ## Not a sandbox
 
-Generated code runs in a child Node process with the same OS user and network as the parent. By default a tool can `import("node:fs")` and read your home directory. The worker isolates faults, not intent: a tool that crashes, hangs, or leaks cannot take your process down, and that is all it promises. If the model talks to untrusted users, run the whole thing in a container or VM.
+Generated code runs in a child Node process with the same OS user and network as the parent. The worker isolates faults, not intent: a tool that crashes, hangs, or leaks cannot take your process down, and that is all the process boundary promises. If the model talks to untrusted users, run the whole thing in a container or VM.
+
+Why not a real sandbox? isolated-vm and vm2-style isolates cannot run Node APIs, and the point of these tools is `fs`, `fetch`, and `child_process`. A microVM or a hosted runner (E2B, the providers' own code execution) is the right answer for untrusted users, and toolhost is the thing you would run inside it, not a replacement. Deno's permission flags would work and Node now has the same idea, which is what toolhost uses.
 
 What is enforced regardless:
 
@@ -28,7 +30,7 @@ What is enforced regardless:
 - The worker is its own process group, so stopping it also stops what a tool spawned.
 - A tool cannot forge error codes. Anything it throws reaches you as `call_failed` with the original in `details`.
 
-With `permissions: true`, the worker runs under Node's permission model: file access is limited to this package, toolhost's `dir`, and the workspace, and child processes are denied unless `exec` is on. Then `import("node:fs")` outside the workspace fails with `ERR_ACCESS_DENIED`. Network is not restricted by that model, and a double-forked daemon can still outlive the worker, which is why the container advice stands.
+By default the worker runs under Node's permission model. File access is limited to this package, toolhost's `dir`, and the workspace; child processes are denied unless `exec` is on; native addons are denied. `import("node:fs")` outside the workspace fails with `ERR_ACCESS_DENIED`. What that does not cover: the workspace is readable and writable, so a `.env` sitting in it is exposed to every tool; the network is not restricted at all; a double-forked daemon can still outlive the worker. Set `permissions: false` only if a tool must read or spawn outside those bounds, and know that it then runs with your full user.
 
 ## Install
 
@@ -36,7 +38,7 @@ With `permissions: true`, the worker runs under Node's permission model: file ac
 npm install github:MZULALI/toolhost
 ```
 
-Not on npm yet, so it installs from GitHub and builds on install. Node 22.18 or newer. One runtime dependency, acorn.
+Installs from GitHub and builds on install; pin a tag for a fixed version. It is not on npm on purpose: a registry name is a promise to keep, and until someone other than the author has run this, the tag is the promise. Node 22.18 or newer. One runtime dependency, acorn.
 
 ## Use
 

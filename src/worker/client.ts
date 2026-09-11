@@ -121,7 +121,7 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
     drainTimeoutMs = 5_000,
     autoRestart = true,
     maxCrashRestarts = 5,
-    permissions = false,
+    permissions = true,
     workerEnv = {}
   }: ToolWorkerClientOptions) {
     super();
@@ -144,8 +144,8 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
     const flags = ["--disable-warning=ExperimentalWarning"];
     if (!this.permissions) return flags;
     const { dir, workspace, capabilities } = this.config;
-    const readable = [PACKAGE_ROOT, dir, workspace].flatMap(withRealPath);
-    const writable = [dir, workspace].flatMap(withRealPath);
+    const readable = coveringPaths([PACKAGE_ROOT, dir, workspace].flatMap(withRealPath));
+    const writable = coveringPaths([dir, workspace].flatMap(withRealPath));
     flags.push("--permission"); // one flag per path: Node no longer accepts comma-separated lists
     flags.push(...readable.map((p) => `--allow-fs-read=${p}`), ...writable.map((p) => `--allow-fs-write=${p}`));
     if (capabilities?.exec) flags.push("--allow-child-process");
@@ -358,7 +358,7 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
         const remoteCode = error?.code;
         const code = remoteCode && STARTUP_CODES.has(remoteCode) ? remoteCode : "startup_failed";
         const message = code === remoteCode ? error.message : `Worker failed to start (${remoteCode ?? "unknown error"}).`;
-        fail("startup-error", new ToolError(code, message, { remoteCode, remoteMessage: error?.message }));
+        fail("startup-error", new ToolError(code, message, { remoteCode, remoteMessage: error?.message, remoteStack: error?.stack }));
       };
       const onExit = () => {
         cleanup();
@@ -438,6 +438,19 @@ function pick(source: NodeJS.ProcessEnv, keys: string[]): Record<string, string>
     if (value !== undefined) out[key] = value;
   }
   return out;
+}
+
+/**
+ * Parents first, children dropped. Node's permission model does not honour a directory that
+ * is listed after one of its own subdirectories, so `dir` inside `workspace` must not precede it.
+ */
+function coveringPaths(paths: string[]): string[] {
+  const sorted = [...new Set(paths)].sort((a, b) => a.length - b.length);
+  const kept: string[] = [];
+  for (const candidate of sorted) {
+    if (!kept.some((parent) => candidate === parent || candidate.startsWith(parent + "/"))) kept.push(candidate);
+  }
+  return kept;
 }
 
 /** A path and, if it differs, its real path, so a symlinked workspace is allowed under both names. */

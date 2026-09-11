@@ -117,8 +117,9 @@ export interface ToolHostOptions {
   onLog?: (entry: LogEntry) => void;
   /**
    * Run the worker under Node's permission model: file access limited to this package, `dir`
-   * and `workspace`; child processes only when `capabilities.exec` is on. Network is not
-   * restricted. Default false.
+   * and `workspace` (read and write); child processes only when `capabilities.exec` is on;
+   * no native addons. Network is not restricted. Default true. Turn off only if a tool must
+   * read or spawn outside those bounds.
    */
   permissions?: boolean;
   /**

@@ -60,7 +60,7 @@ export class ToolHost {
     maxResultBytes = 1_000_000,
     maxSourceBytes = DEFAULT_MAX_SOURCE_BYTES,
     onLog = noop,
-    permissions = false,
+    permissions = true,
     workerEnv = {},
     validateArgs: shouldValidateArgs = true
   }: ToolHostOptions) {

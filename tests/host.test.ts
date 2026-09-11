@@ -6,7 +6,8 @@ import { once } from "node:events";
 import { createToolHost, ToolHost, toAnthropic, toOpenAIChat, toOpenAIResponses } from "../src/index.ts";
 import { echoSchema, withTempDir } from "./helpers.ts";
 
-const quiet = { onLog: () => {} };
+/** Most tests exercise the worker without Node's permission model; the permissions test turns it on explicitly. */
+const quiet = { onLog: () => {}, permissions: false };
 
 /** `host.call` returns `unknown`; tests read into results, so widen once here. */
 const call = (host: ToolHost, name: string, args: Record<string, unknown> = {}): Promise<any> => host.call(name, args);
@@ -594,7 +595,8 @@ test("with permissions on, a tool cannot read outside the workspace or spawn, ev
     await fs.mkdir(workspace);
     await fs.writeFile(path.join(workspace, "in.txt"), "inside");
     await fs.writeFile(path.join(dir, "out.txt"), "outside");
-    const host = await createToolHost({ dir: path.join(dir, "host"), workspace, permissions: true, ...quiet });
+    assert.equal(new ToolHost({ dir: path.join(dir, "probe"), workspace }).worker.permissions, true, "the permission model is on by default");
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace, ...quiet, permissions: true });
     try {
       await create(host, "rawread", "const fs = await import('node:fs/promises'); return fs.readFile(args.value, 'utf8');");
       await create(host, "spawn", "const { execSync } = await import('node:child_process'); return String(execSync('echo hi'));");
@@ -608,7 +610,7 @@ test("with permissions on, a tool cannot read outside the workspace or spawn, ev
     } finally {
       await host.stop();
     }
-    const withExec = await createToolHost({ dir: path.join(dir, "host2"), workspace, permissions: true, capabilities: { exec: true }, ...quiet });
+    const withExec = await createToolHost({ dir: path.join(dir, "host2"), workspace, capabilities: { exec: true }, ...quiet, permissions: true });
     try {
       await create(withExec, "sh", "return ctx.exec('echo hi');");
       assert.equal((await call(withExec, "sh", {})).stdout.trim(), "hi", "exec is allowed when the capability is on");
