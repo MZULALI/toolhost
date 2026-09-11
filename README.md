@@ -6,7 +6,7 @@ Let an LLM write its own tools at runtime.
 
 The model calls `create_tool` with a name, a JSON Schema, and a function body. toolhost parses the source, proves the body adds no top-level code, saves it to SQLite with full history, and restarts an isolated worker. On the next turn the tool is in the model's list and callable. If the tool is wrong, the model reads the error, fixes it, or rolls it back.
 
-<img src="docs/demo.svg" alt="A broken tool is rejected with a line number, fixed, called, broken again by an update, and restored from history" width="820">
+<img src="docs/demo.svg" alt="Output of examples/offline.ts: a broken tool is rejected with a line number, fixed, called, broken again by an update, and restored from history" width="820">
 
 ```
 model ──create_tool──▶ registry ──▶ SQLite (versioned) ──▶ modules/*.mjs
@@ -34,7 +34,7 @@ Arguments are not validated against the tool's schema, by toolhost or reliably b
 npm install github:MZULALI/toolhost
 ```
 
-Node 22.18 or newer. Builds from source on install. One runtime dependency, acorn.
+Not on npm yet, so it installs from GitHub and builds on install. Node 22.18 or newer. One runtime dependency, acorn.
 
 ## Use
 
@@ -89,6 +89,8 @@ npm test          # node --test on the TypeScript sources, loopback only
 npm run typecheck # src, tests, and examples
 npm run build     # dist/ with declarations
 ```
+
+The tests are mostly the failure cases: a symlink inside the workspace that points out, a dangling one, a worker killed mid-call, a tool that throws inside a timer, eight concurrent updates to one tool, `stop()` racing a `create_tool`, a tool forging a lifecycle error code, a schema with a cycle, a 5 MB source. The offline example runs in CI on Ubuntu and macOS, Node 22 and 24.
 
 Node 22 prints an `ExperimentalWarning` for `node:sqlite` once per process; toolhost silences it in the worker, and `node --disable-warning=ExperimentalWarning` silences it in yours. Node 24 does not warn.
 
