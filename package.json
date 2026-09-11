@@ -22,6 +22,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
     "check": "npm run typecheck && npm test",

@@ -1,8 +1,10 @@
 # toolhost
 
+[![ci](https://github.com/MZULALI/toolhost/actions/workflows/ci.yml/badge.svg)](https://github.com/MZULALI/toolhost/actions/workflows/ci.yml)
+
 Let an LLM write its own tools at runtime.
 
-The model calls `create_tool` with a name, a JSON Schema, and a function body. toolhost parses the source, proves it cannot escape its function, saves it to SQLite with full history, and restarts an isolated worker. On the next turn the tool is in the model's list and callable.
+The model calls `create_tool` with a name, a JSON Schema, and a function body. toolhost parses the source, proves the body adds no top-level code, saves it to SQLite with full history, and restarts an isolated worker. On the next turn the tool is in the model's list and callable.
 
 ```
 model ──create_tool──▶ registry ──▶ SQLite (versioned) ──▶ modules/*.mjs
@@ -24,6 +26,8 @@ model ──my_tool───────▶ host ──IPC──▶ worker proce
 ```sh
 npm install toolhost
 ```
+
+Not on the npm registry yet. Until it is, `npm install github:MZULALI/toolhost` builds from source on install.
 
 ## Quickstart
 
@@ -62,7 +66,7 @@ Run any of them with `node examples/<name>.ts` after `npm run build`.
 
 | Built-in tool | |
 |---|---|
-| `create_tool` | Save a new tool. Callable after the worker restarts, about 30 ms. |
+| `create_tool` | Save a new tool. Callable once the worker has restarted. |
 | `update_tool` | Change any field, disable, re-enable, or `restore_version` from history. |
 | `delete_tool` | Remove a tool. Returns the `restore_version` that undoes it. |
 | `list_tools` | List generated tools. |
@@ -80,7 +84,8 @@ What the `ctx` helpers do enforce, and only for themselves:
 - File helpers resolve real paths and refuse anything outside `workspace`, including symlinks that lead out, dangling symlinks, and toolhost's own `dir`.
 - Source is parsed before it is saved; a body that closes its function early is rejected, so the module on disk runs no code at import time.
 - The worker is its own process group, so stopping it also stops what a tool spawned. A double-forked daemon can still outlive it.
-- Arguments are **not** validated against the tool's schema. The provider does that.
+- Arguments are **not** validated against the tool's schema. Providers enforce schemas loosely at best (the OpenAI adapter sets `strict: false` because generated schemas may have optional fields), so a tool must check its own `args`.
+- `call_failed` errors carry the worker's stack in `details.remoteStack`, with file paths. Feed the model `code` and `message`, as the examples do, not the whole error.
 - One host per `dir`, enforced with a lock file.
 
 ## API
