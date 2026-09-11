@@ -24,10 +24,10 @@ model ──my_tool───────▶ host ──IPC──▶ worker proce
 ## Install
 
 ```sh
-npm install toolhost
+npm install github:MZULALI/toolhost
 ```
 
-Not on the npm registry yet. Until it is, `npm install github:MZULALI/toolhost` builds from source on install.
+Builds from source on install. Needs Node 22.18 or newer.
 
 ## Quickstart
 
