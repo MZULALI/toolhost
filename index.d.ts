@@ -56,6 +56,7 @@ export type ToolErrorCode =
   | "invalid_source"
   | "invalid_argument"
   | "invalid_path"
+  | "internal_error"
   | "exists"
   | "not_found"
   | "recursive_call"
@@ -64,6 +65,9 @@ export type ToolErrorCode =
   | "file_error"
   | "capability_disabled"
   | "call_failed"
+  | "fetch_failed"
+  | "fetch_timeout"
+  | "fetch_too_large"
   | "unserializable_result"
   | "result_too_large"
   | "timeout"
@@ -97,9 +101,17 @@ export interface ToolHostOptions {
   readyTimeoutMs?: number;
   /** How long a worker gets to exit on SIGTERM before SIGKILL. Default 1000. */
   killGraceMs?: number;
-  /** Largest JSON result a tool may return, in bytes. Default 1_000_000. */
+  /** How long a tool change waits for in-flight calls before replacing the worker. Default 5000. */
+  drainTimeoutMs?: number;
+  /** Re-fork the worker after an unexpected exit. Default true. */
+  autoRestart?: boolean;
+  /** Consecutive crashes before the worker emits "unhealthy" and stays down. Default 5. */
+  maxCrashRestarts?: number;
+  /** Largest JSON result a tool may return, in bytes. Also the default cap for `ctx.fetchJson`. Default 1_000_000. */
   maxResultBytes?: number;
-  /** Receives the worker's stdout/stderr and warnings. Default: write to the parent's stderr unless NODE_ENV is "production". */
+  /** Largest `execute_source` accepted, in bytes. Default 262_144. */
+  maxSourceBytes?: number;
+  /** Receives the worker's stdout, stderr, and warnings (unhandled rejections in tools). Default: discard. */
   onLog?: (entry: LogEntry) => void;
 }
 
@@ -171,9 +183,10 @@ export interface UpdateToolInput {
 }
 
 export class ToolRegistry {
-  constructor(options: { store: ToolStore; modulesDir: string });
+  constructor(options: { store: ToolStore; modulesDir: string; maxSourceBytes?: number });
   readonly store: ToolStore;
   readonly modulesDir: string;
+  maxSourceBytes: number;
   init(): Promise<void>;
   list(options?: { includeDisabled?: boolean; includeSource?: boolean }): Tool[];
   definitions(): ToolDefinition[];
@@ -257,8 +270,10 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
 
 /** The five built-in tools the model uses to manage its own tools. */
 export const coreTools: readonly ToolDefinition[];
+/** Their names, reserved case-insensitively. */
+export const RESERVED_NAMES: readonly string[];
 /** Case-insensitive. */
-export function isCoreTool(name: string): boolean;
+export function isCoreTool(name: unknown): boolean;
 
 export function toAnthropic(tools: ToolDefinition[]): Array<{ name: string; description: string; input_schema: JsonSchema }>;
 export function toOpenAIResponses(tools: ToolDefinition[]): Array<{ type: "function"; name: string; description: string; parameters: JsonSchema }>;
@@ -271,6 +286,9 @@ export function buildModuleSource(tool: ToolDefinition & { executeSource: string
 export function assertModuleSource(moduleSource: string): void;
 export function normalizeToolSchema(input: unknown): JsonSchema;
 export const TOOL_NAME_PATTERN: RegExp;
+/** Throws `invalid_name` unless `name` matches TOOL_NAME_PATTERN exactly. */
 export function assertToolName(name: unknown): string;
-/** Resolve a path inside `root` by real path; rejects lexical and symlink escapes. */
+/** As `assertToolName`, and also rejects the built-in tool names. */
+export function assertUserToolName(name: unknown): string;
+/** Resolve a path inside `root` by real path; rejects lexical escapes, symlinks that lead out, and dangling symlinks. */
 export function resolveInside(root: string, inputPath: unknown): Promise<string>;

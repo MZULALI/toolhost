@@ -14,6 +14,8 @@ const CONTEXT_DOCS =
   "and callTool(name, args) to call another generated tool. " +
   "Return a plain JSON value (object, array, string, number, boolean or null); anything else is dropped or rejected.";
 
+import { RESERVED_NAMES } from "./names.js";
+
 export const coreTools = Object.freeze([
   {
     name: "create_tool",
@@ -38,7 +40,7 @@ export const coreTools = Object.freeze([
         type: "string",
         description:
           "JavaScript body of `async function execute(args, ctx)`. " +
-          "If you include the outer function it is unwrapped. The source is stored exactly as sent."
+          "If you include the outer function it is unwrapped. Nothing inside the body is reformatted."
       }
     })
   },
@@ -56,7 +58,8 @@ export const coreTools = Object.freeze([
     name: "read_tool",
     description:
       "Read one tool's description, parameter schema, and optionally its source and version history. " +
-      "Use the history to see what a tool looked like before a change broke it.",
+      "Use the history to see what a tool looked like before a change broke it. " +
+      "A deleted tool still has history: read it with include_history, then restore a version with update_tool.",
     parameters: objectSchema(
       {
         name: { type: "string", description: "Tool name." },
@@ -96,12 +99,7 @@ export const coreTools = Object.freeze([
   }
 ]);
 
-const coreToolNames = new Set(coreTools.map((tool) => tool.name.toLowerCase()));
-
-/** Case-insensitive, matching the store's uniqueness rule. @param {string} name */
-export function isCoreTool(name) {
-  return typeof name === "string" && coreToolNames.has(name.toLowerCase());
-}
+export { isCoreTool } from "./names.js";
 
 /** Anthropic Messages API: `{ name, description, input_schema }`. */
 export function toAnthropic(tools) {
@@ -119,4 +117,8 @@ export function toOpenAIChat(tools) {
     type: "function",
     function: { name, description, parameters }
   }));
+}
+
+if (coreTools.some((tool, i) => tool.name !== RESERVED_NAMES[i])) {
+  throw new Error("coreTools and RESERVED_NAMES are out of sync.");
 }

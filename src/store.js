@@ -5,7 +5,9 @@ import { ToolError } from "./errors.js";
 
 /**
  * SQLite persistence for tools. Every save appends to `tool_versions`, so nothing a
- * model writes is ever lost; `tools` holds the current version of each name.
+ * model writes is ever lost; `tools` holds the current version of each name. History rows
+ * keep what the model authored (description, schema, source); the assembled module is
+ * derived, so it is stored only for the current version.
  *
  * Names are unique case-insensitively, because a name is also a file name and the file
  * system may not distinguish `Echo` from `echo`.
@@ -41,7 +43,6 @@ export class ToolStore {
         description     TEXT NOT NULL,
         parameters_json TEXT NOT NULL,
         execute_source  TEXT NOT NULL,
-        module_source   TEXT NOT NULL,
         enabled         INTEGER NOT NULL,
         created_at      TEXT NOT NULL
       );
@@ -142,10 +143,10 @@ export class ToolStore {
   #appendVersion(tool, operation, at) {
     const result = this.db
       .prepare(
-        `INSERT INTO tool_versions (tool_name, operation, description, parameters_json, execute_source, module_source, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO tool_versions (tool_name, operation, description, parameters_json, execute_source, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(tool.name, operation, tool.description, tool.parametersJson, tool.executeSource, tool.moduleSource, tool.enabled ? 1 : 0, at);
+      .run(tool.name, operation, tool.description, tool.parametersJson, tool.executeSource, tool.enabled ? 1 : 0, at);
     return Number(result.lastInsertRowid);
   }
 }

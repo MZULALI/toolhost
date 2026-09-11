@@ -5,21 +5,26 @@
  * messages until it is killed. A tool change restarts the whole worker rather than
  * reloading a module, so there is never a stale module in memory.
  */
+import fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { DEFAULT_CAPABILITIES } from "../capabilities.js";
 import { modulePath, syncModules } from "../files.js";
-import { CONFIG_ENV, READY, RESULT, STARTUP_ERROR, WARNING, isCall, serializeError } from "../protocol.js";
+import { CALL, CONFIG_ENV, READY, RESULT, STARTUP_ERROR, WARNING, isCall, serializeError } from "../protocol.js";
 import { ToolStore } from "../store.js";
 import { ToolError } from "../errors.js";
-import { DEFAULT_CAPABILITIES, createContext } from "./context.js";
+import { createContext } from "./context.js";
 
 const config = JSON.parse(process.env[CONFIG_ENV] ?? "{}");
 const capabilities = { ...DEFAULT_CAPABILITIES, ...(config.capabilities ?? {}) };
 const maxResultBytes = config.maxResultBytes ?? 1_000_000;
+/** Resolved once so `ctx.workspace` and the confinement check agree even when the workspace is a symlink. */
+let workspace = config.workspace;
 
 /** @type {Map<string, { execute: Function }>} */
 const tools = new Map();
 
 async function loadTools() {
+  workspace = await fs.realpath(config.workspace);
   const store = new ToolStore(config.dbPath);
   try {
     await syncModules(store, config.modulesDir);
@@ -38,7 +43,7 @@ async function loadTools() {
 async function runTool(name, args, stack = []) {
   const tool = tools.get(name);
   if (!tool) throw new ToolError("not_found", `Unknown tool: ${name}`);
-  const ctx = createContext({ toolName: name, workspace: config.workspace, capabilities, callTool: runTool, stack });
+  const ctx = createContext({ toolName: name, workspace, capabilities, maxResultBytes, callTool: runTool, stack });
   return tool.execute(args ?? {}, ctx);
 }
 
@@ -62,12 +67,15 @@ function toResultJson(name, value) {
 }
 
 process.on("message", async (message) => {
-  if (!isCall(message)) return;
+  if (!message || typeof message !== "object" || message.type !== CALL) return;
+  const id = typeof message.id === "string" ? message.id : null;
+  if (!id) return; // nothing to reply to
   try {
+    if (!isCall(message)) throw new ToolError("invalid_name", "Tool name must be a string.");
     const result = await runTool(message.name, message.args);
-    process.send({ type: RESULT, id: message.id, ok: true, resultJson: toResultJson(message.name, result) });
+    process.send({ type: RESULT, id, ok: true, resultJson: toResultJson(message.name, result) });
   } catch (error) {
-    process.send({ type: RESULT, id: message.id, ok: false, error: serializeError(error) });
+    process.send({ type: RESULT, id, ok: false, error: serializeError(error) });
   }
 });
 

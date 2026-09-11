@@ -1,12 +1,13 @@
 import { ToolError } from "./errors.js";
 import { removeModule, syncModules, writeModule } from "./files.js";
-import { assertToolName } from "./names.js";
+import { assertUserToolName } from "./names.js";
 import { normalizeToolSchema } from "./schema.js";
 import { assertModuleSource, buildModuleSource, unwrapExecuteSource } from "./source.js";
-import { isCoreTool } from "./definitions.js";
 
 /** Shorter than this and the model cannot tell when to call the tool. */
 const MIN_DESCRIPTION_LENGTH = 12;
+/** Larger than this and it is not a tool, it is a data file; every version is kept forever. */
+export const DEFAULT_MAX_SOURCE_BYTES = 256 * 1024;
 
 /**
  * Create, read, update, restore and delete tools. Every write is validated before it
@@ -14,10 +15,11 @@ const MIN_DESCRIPTION_LENGTH = 12;
  * is parsed. Nothing here executes model-written code; that only happens in the worker.
  */
 export class ToolRegistry {
-  /** @param {{ store: import("./store.js").ToolStore, modulesDir: string }} options */
-  constructor({ store, modulesDir }) {
+  /** @param {{ store: import("./store.js").ToolStore, modulesDir: string, maxSourceBytes?: number }} options */
+  constructor({ store, modulesDir, maxSourceBytes = DEFAULT_MAX_SOURCE_BYTES }) {
     this.store = store;
     this.modulesDir = modulesDir;
+    this.maxSourceBytes = maxSourceBytes;
   }
 
   /** Make the module directory match the store. Call once before the worker starts. */
@@ -59,7 +61,7 @@ export class ToolRegistry {
       const hint = collision === name ? "" : ` (names are case-insensitive; "${collision}" exists)`;
       throw new ToolError("exists", `Tool "${name}" already exists${hint}. Use update_tool to change it.`);
     }
-    const tool = assembleTool({
+    const tool = this.#assemble({
       name,
       description: input?.description,
       parameters: input?.parameters,
@@ -78,7 +80,7 @@ export class ToolRegistry {
     const current = this.store.get(name, { includeSource: true });
     if (!current) throw new ToolError("not_found", `Tool "${name}" does not exist. Use create_tool first.`);
 
-    const tool = assembleTool({
+    const tool = this.#assemble({
       name,
       description: nonEmpty(input?.description) ?? current.description,
       parameters: nonEmpty(input?.parameters) ?? current.parameters,
@@ -98,7 +100,7 @@ export class ToolRegistry {
     if (!version) {
       throw new ToolError("not_found", `Tool "${validName}" has no version ${versionId}. Use read_tool with include_history to list versions.`);
     }
-    const tool = assembleTool({
+    const tool = this.#assemble({
       name: validName,
       description: version.description,
       parameters: version.parameters,
@@ -121,33 +123,34 @@ export class ToolRegistry {
     await writeModule(this.modulesDir, tool);
     return saved;
   }
+
+  #assemble({ name, description, parameters, executeSource, enabled }) {
+    const cleanDescription = typeof description === "string" ? description.trim() : "";
+    if (cleanDescription.length < MIN_DESCRIPTION_LENGTH) {
+      throw new ToolError(
+        "invalid_description",
+        `description must be at least ${MIN_DESCRIPTION_LENGTH} characters so the model knows when to call the tool.`
+      );
+    }
+    const schema = normalizeToolSchema(parameters);
+    const body = unwrapExecuteSource(executeSource);
+    const bytes = Buffer.byteLength(body);
+    if (bytes > this.maxSourceBytes) {
+      throw new ToolError(
+        "invalid_source",
+        `execute_source is ${bytes} bytes; the limit is ${this.maxSourceBytes}. Keep data out of the tool and read it from a file instead.`
+      );
+    }
+    const moduleSource = buildModuleSource({ name, description: cleanDescription, parameters: schema, executeSource: body });
+    assertModuleSource(moduleSource);
+    return { name, description: cleanDescription, parameters: schema, executeSource: body, moduleSource, enabled };
+  }
 }
 
-function assertName(name) {
-  const value = assertToolName(name);
-  if (isCoreTool(value)) {
-    throw new ToolError("invalid_name", `"${value}" is a built-in tool and cannot be created or changed.`);
-  }
-  return value;
-}
+const assertName = assertUserToolName;
 
 function nonEmpty(value) {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string" && !value.trim()) return undefined;
   return value;
-}
-
-function assembleTool({ name, description, parameters, executeSource, enabled }) {
-  const cleanDescription = typeof description === "string" ? description.trim() : "";
-  if (cleanDescription.length < MIN_DESCRIPTION_LENGTH) {
-    throw new ToolError(
-      "invalid_description",
-      `description must be at least ${MIN_DESCRIPTION_LENGTH} characters so the model knows when to call the tool.`
-    );
-  }
-  const schema = normalizeToolSchema(parameters);
-  const body = unwrapExecuteSource(executeSource);
-  const moduleSource = buildModuleSource({ name, description: cleanDescription, parameters: schema, executeSource: body });
-  assertModuleSource(moduleSource);
-  return { name, description: cleanDescription, parameters: schema, executeSource: body, moduleSource, enabled };
 }

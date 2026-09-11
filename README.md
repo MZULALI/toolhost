@@ -15,7 +15,8 @@ model ──my_tool───────▶ host ──IPC──▶ worker proce
 - **Any provider.** Tools are plain `{ name, description, parameters }`. Adapters give the exact shape for Anthropic, OpenAI Responses, and OpenAI Chat Completions.
 - **Real parser, not regex.** Model output is unwrapped and validated with [acorn](https://github.com/acornjs/acorn). Errors carry a line number and are worded for the model, so it fixes its own mistakes. Source is stored verbatim, never reformatted.
 - **Nothing hangs, nothing bricks.** A hung tool times out. A crashed worker fails in-flight calls with a typed error and is re-forked with backoff. A floating promise in model code is reported, not fatal. Tool changes wait for running calls to finish before the worker is replaced.
-- **Nothing is lost.** Every create, update and delete is appended to history, and the model can read it and roll back.
+- **Nothing is lost.** Every create, update and delete is appended to history. The model can read it and roll back, including a tool it deleted.
+- **Every failure is a `ToolError`** with a stable code and a message written for the model. No raw stacks, no host paths.
 - **One dependency** (acorn), Node 22.13+, built-in `node:sqlite`.
 
 ## Install
@@ -62,9 +63,9 @@ Five built-in tools, exported as `coreTools`:
 |---|---|
 | `create_tool` | Save a new tool. Callable after the worker restarts, about 30 ms. |
 | `update_tool` | Change any field, disable and re-enable, or `restore_version` from history. Omitted fields keep their value. |
-| `delete_tool` | Remove a tool. History is kept; `update_tool` with `restore_version` brings it back. |
+| `delete_tool` | Remove a tool. Returns the `restore_version` that undoes it. |
 | `list_tools` | List generated tools. |
-| `read_tool` | Read a tool's schema and, optionally, its source and version history. |
+| `read_tool` | Read a tool's schema and, optionally, its source and version history. Works on deleted tools with `include_history`. |
 
 The implementation the model writes is the body of `async function execute(args, ctx)`. If it sends the whole function, an exported one, or `const execute = async () => {}`, toolhost unwraps it. Inside, `ctx` offers:
 
@@ -72,11 +73,13 @@ The implementation the model writes is the body of `async function execute(args,
 |---|---|
 | `workspace` | Absolute path of the workspace root. |
 | `readText`, `writeText`, `appendText`, `listFiles` | Confined to the workspace by real path, so symlinks cannot lead out. Errors name the path the model used, not the host's. |
-| `fetchJson(url, init)` | Returns `{ ok, status, headers, body }`. Body is parsed JSON, or text if it is not JSON. |
+| `fetchJson(url, init)` | Returns `{ ok, status, headers, body }`. Body is parsed JSON, or text if it is not JSON. 30 s timeout and a response cap of `maxResultBytes`, both overridable per call with `timeoutMs` and `maxBytes`. |
 | `callTool(name, args)` | Call another generated tool. Cycles throw `recursive_call` naming the chain. |
 | `exec(command, options)` | **Off by default.** Runs a shell with a minimal environment. See Security. |
 
-Results must be JSON. Anything else is rejected with `unserializable_result`, and anything over `maxResultBytes` (1 MB) with `result_too_large`, both with a message telling the model what to do instead.
+Results must be JSON. Anything else is rejected with `unserializable_result`, and anything over `maxResultBytes` (1 MB) with `result_too_large`, both with a message telling the model what to do instead. Sources over `maxSourceBytes` (256 KB) are refused before they are stored.
+
+A tool's `console.log` and any unhandled rejection inside it go to the `onLog` option. Nothing is printed unless you pass one.
 
 ## Security
 
@@ -90,6 +93,8 @@ What toolhost does do, and what it does not:
 - Names are restricted to `[A-Za-z][A-Za-z0-9_]{0,63}` and are unique ignoring case, so a name is always a safe, unambiguous file name.
 - Arguments are **not** validated against the tool's schema. The provider does that; toolhost passes them through.
 - One host per `dir`, enforced with a lock file. A second host on the same directory would advertise tools its own worker has not loaded.
+- The worker runs in its own process group on Unix, so stopping or restarting it also kills processes a tool spawned. A tool that double-forks and detaches can still outlive it. On Windows only the worker itself is signalled.
+- `fetchJson` has a timeout and a size cap; `exec` has a timeout and an output cap. A tool that opens its own sockets or spawns its own processes is bound by neither.
 
 ## API
 
@@ -105,8 +110,12 @@ Creates a host and starts its worker. Options:
 | `callTimeoutMs` | `30000` | Per-call timeout for generated tools. |
 | `readyTimeoutMs` | `5000` | How long to wait for the worker to load. |
 | `killGraceMs` | `1000` | SIGTERM to SIGKILL escalation. |
-| `maxResultBytes` | `1000000` | Largest result a tool may return. |
-| `onLog` | stderr | Receives the worker's stdout, stderr, and warnings. |
+| `drainTimeoutMs` | `5000` | How long a tool change waits for running calls before replacing the worker. |
+| `autoRestart` | `true` | Re-fork the worker after an unexpected exit, with backoff. |
+| `maxCrashRestarts` | `5` | Consecutive crashes before the worker emits `unhealthy` and stays down. |
+| `maxResultBytes` | `1000000` | Largest result a tool may return; also the default `fetchJson` cap. |
+| `maxSourceBytes` | `262144` | Largest `execute_source` accepted. |
+| `onLog` | discard | Receives the worker's stdout, stderr, and warnings. |
 
 ### `ToolHost`
 
@@ -125,9 +134,10 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 |---|---|
 | `invalid_name`, `invalid_description`, `invalid_schema`, `invalid_source` | Validation. `invalid_source` carries `details.line` and `details.column`. |
 | `exists`, `not_found` | Registry state. |
-| `recursive_call`, `path_outside_workspace`, `file_not_found`, `file_error`, `invalid_path`, `capability_disabled`, `invalid_argument` | Raised inside `ctx`. |
+| `recursive_call`, `path_outside_workspace`, `file_not_found`, `file_error`, `invalid_path`, `fetch_failed`, `fetch_timeout`, `fetch_too_large`, `capability_disabled`, `invalid_argument` | Raised inside `ctx`. |
 | `call_failed`, `unserializable_result`, `result_too_large`, `timeout` | The tool ran and something went wrong. `call_failed` wraps whatever the tool threw and carries `details.remoteStack`. |
 | `worker_unavailable`, `startup_failed`, `host_stopped`, `dir_in_use` | Lifecycle. |
+| `internal_error` | A bug in toolhost. Please report it. |
 
 ### Worker events
 
@@ -139,7 +149,7 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 
 ### Lower level
 
-`ToolRegistry` (validation and CRUD), `ToolStore` (SQLite), `ToolWorkerClient` (process lifecycle and IPC), `unwrapExecuteSource`, `assertModuleSource`, `normalizeToolSchema`, `resolveInside`. Each is small and independently tested; see [`index.d.ts`](index.d.ts).
+`ToolRegistry` (validation and CRUD), `ToolStore` (SQLite), `ToolWorkerClient` (process lifecycle and IPC), `unwrapExecuteSource`, `assertModuleSource`, `normalizeToolSchema`, `assertToolName`, `resolveInside`. Each is small and independently tested; see [`index.d.ts`](index.d.ts), which is typechecked in CI against a consumer that uses every export.
 
 ## How a tool change works
 
@@ -152,8 +162,9 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 ## Development
 
 ```sh
-npm test      # node --test, 34 tests, no network, about a second
-npm run check # syntax check
+npm test          # node --test, 49 tests, loopback only, a few seconds
+npm run check     # syntax check
+npm run typecheck # tsc --strict over a consumer of every export
 ```
 
 ## License

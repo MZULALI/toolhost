@@ -39,6 +39,8 @@ export class ToolWorkerClient extends EventEmitter {
   #crashWait = null;
   #healthyTimer = null;
   #stopReasons = new WeakMap();
+  /** The child whose startup restart() is currently awaiting; its death is reported by restart(), not supervised. */
+  #starting = null;
 
   /**
    * @param {{
@@ -138,9 +140,12 @@ export class ToolWorkerClient extends EventEmitter {
     const child = fork(WORKER_PATH, [], {
       stdio: ["ignore", "pipe", "pipe", "ipc"],
       execArgv: ["--disable-warning=ExperimentalWarning"],
-      env: { ...process.env, [CONFIG_ENV]: JSON.stringify(this.config) }
+      env: { ...process.env, [CONFIG_ENV]: JSON.stringify(this.config) },
+      // Own process group, so stopping the worker also stops anything a tool spawned.
+      detached: USE_PROCESS_GROUPS
     });
     this.#child = child;
+    this.#starting = child;
 
     child.stdout.on("data", (chunk) => this.emit("log", { stream: "stdout", text: String(chunk) }));
     child.stderr.on("data", (chunk) => this.emit("log", { stream: "stderr", text: String(chunk) }));
@@ -152,7 +157,11 @@ export class ToolWorkerClient extends EventEmitter {
     });
     child.on("exit", (code, signal) => this.#onExit(child, code, signal));
 
-    await this.#waitUntilReady(child);
+    try {
+      await this.#waitUntilReady(child);
+    } finally {
+      if (this.#starting === child) this.#starting = null;
+    }
     return this.status();
   }
 
@@ -166,7 +175,7 @@ export class ToolWorkerClient extends EventEmitter {
     };
     this.#lastExit = exit;
     this.emit("exit", exit);
-    if (deliberate || this.#child !== child) return;
+    if (deliberate || this.#child !== child || this.#starting === child) return;
 
     // Unexpected death of the current worker.
     this.#child = null;
@@ -190,6 +199,7 @@ export class ToolWorkerClient extends EventEmitter {
     this.emit("restarting", { attempt: this.#crashes, delayMs });
     let release;
     this.#crashWait = { promise: new Promise((resolve) => (release = resolve)), release };
+    // Not unref'd: a scheduled restart is real work and must keep the process alive.
     this.#crashTimer = setTimeout(() => {
       this.restart("crash")
         .catch((error) => this.emit("unhealthy", { crashes: this.#crashes, lastExit: this.#lastExit, error }))
@@ -215,12 +225,12 @@ export class ToolWorkerClient extends EventEmitter {
 
     if (child.exitCode === null && child.signalCode === null) {
       await new Promise((resolve) => {
-        const timer = setTimeout(() => child.kill("SIGKILL"), this.killGraceMs);
+        const timer = setTimeout(() => signal(child, "SIGKILL"), this.killGraceMs);
         child.once("exit", () => {
           clearTimeout(timer);
           resolve();
         });
-        child.kill("SIGTERM");
+        signal(child, "SIGTERM");
       });
     }
     this.#failAll(new ToolError("worker_unavailable", `Worker was stopped (${reason}) before the call completed.`));
@@ -313,3 +323,18 @@ export class ToolWorkerClient extends EventEmitter {
 }
 
 function noop() {}
+
+const USE_PROCESS_GROUPS = process.platform !== "win32";
+
+/** Signal the worker's whole process group where supported, else just the worker. */
+function signal(child, name) {
+  if (USE_PROCESS_GROUPS) {
+    try {
+      process.kill(-child.pid, name);
+      return;
+    } catch {
+      // Group already gone or not ours; fall through to the single process.
+    }
+  }
+  child.kill(name);
+}

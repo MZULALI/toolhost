@@ -60,12 +60,14 @@ test("history is readable and any version, including a deleted one, can be resto
       await host.call("update_tool", { name: "v", restore_version: first });
       assert.equal(await host.call("v", { value: "" }), 1);
 
-      await host.call("delete_tool", { name: "v" });
+      const deleted = await host.call("delete_tool", { name: "v" });
       await assert.rejects(host.call("read_tool", { name: "v", include_source: false }), (error) => error.code === "not_found");
       await assert.rejects(host.call("update_tool", { name: "v", execute_source: "return 9;" }), (error) => error.code === "not_found");
-      const deletion = host.history("v")[0];
-      assert.equal(deletion.operation, "delete");
-      await host.call("update_tool", { name: "v", restore_version: deletion.id });
+      const afterDelete = await host.call("read_tool", { name: "v", include_source: false, include_history: true });
+      assert.equal(afterDelete.tool, null, "a deleted tool has no current version");
+      assert.equal(afterDelete.history[0].operation, "delete");
+      assert.equal(afterDelete.history[0].version, deleted.restore_version, "delete_tool hands back the id needed to undo it");
+      await host.call("update_tool", { name: "v", restore_version: afterDelete.history[0].version });
       assert.equal(await host.call("v", { value: "" }), 1, "a deleted tool comes back through update_tool.restore_version");
 
       await assert.rejects(host.call("update_tool", { name: "v", restore_version: 99999 }), (error) => error.code === "not_found");
@@ -225,6 +227,64 @@ test("concurrent creates all succeed and in-flight calls survive a restart", () 
     }
   }));
 
+test("concurrent updates of one tool all succeed and every error is a ToolError", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    try {
+      await create(host, "same", "return 0;");
+      const results = await Promise.allSettled(
+        Array.from({ length: 8 }, (_, i) => host.call("update_tool", { name: "same", execute_source: `return ${i + 1};` }))
+      );
+      const failures = results.filter((r) => r.status === "rejected");
+      assert.deepEqual(failures.map((r) => r.reason.name), [], failures.map((r) => r.reason.message).join("|"));
+      const value = await host.call("same", {});
+      assert.ok(Number.isInteger(value) && value >= 1 && value <= 8, "the worker runs one of the written versions");
+      assert.equal(host.history("same").length, 9);
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("call() never rejects with anything but a ToolError, and never hangs on bad input", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, callTimeoutMs: 5_000, ...quiet });
+    try {
+      const started = Date.now();
+      for (const bad of [null, undefined, 42, {}]) {
+        await assert.rejects(host.call(bad, {}), (error) => error.name === "ToolError" && error.code === "invalid_name", String(bad));
+      }
+      assert.ok(Date.now() - started < 1000, "rejected immediately, not after the call timeout");
+      await assert.rejects(host.call("create_tool", "not an object"), (error) => error.name === "ToolError");
+      await assert.rejects(host.call("read_tool", { name: 7 }), (error) => error.name === "ToolError" && error.code === "invalid_name");
+      await assert.rejects(host.call("update_tool", { name: "x", restore_version: "3" }), (error) => error.code === "invalid_argument");
+      await assert.rejects(host.call("update_tool", { name: "x", restore_version: 1.5 }), (error) => error.code === "invalid_argument");
+      const cyclic = { type: "object", properties: {} };
+      cyclic.properties.self = cyclic;
+      await assert.rejects(host.registry.create({ name: "c", description: "Cyclic schema tool.", parameters: cyclic, executeSource: "return 1;" }), (error) => error.code === "invalid_schema");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("a change whose restart fails is rolled back for create, update and delete", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    try {
+      await create(host, "stable", "return 'v1';");
+      host.worker.readyTimeoutMs = 1;
+      await assert.rejects(create(host, "doomed", "return 1;"), (error) => error.code === "worker_unavailable" && /rolled back/.test(error.message));
+      await assert.rejects(host.call("update_tool", { name: "stable", execute_source: "return 'v2';" }), (error) => /rolled back/.test(error.message));
+      await assert.rejects(host.call("delete_tool", { name: "stable" }), (error) => /rolled back/.test(error.message));
+      host.worker.readyTimeoutMs = 5_000;
+      await host.worker.restart("recover");
+      assert.deepEqual(host.tools().slice(5).map((t) => t.name), ["stable"]);
+      assert.equal(await host.call("stable", {}), "v1");
+      assert.deepEqual((await fs.readdir(path.join(dir, "host", "modules"))).sort(), ["stable.mjs"]);
+    } finally {
+      await host.stop();
+    }
+  }));
+
 test("names are exact and case-insensitively unique; core names are reserved", () =>
   withTempDir(async (dir) => {
     const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
@@ -265,6 +325,118 @@ test("ctx confines files by real path, blocks recursion, and disables exec by de
 
       await create(host, "sh", "return ctx.exec('echo hi');");
       await assert.rejects(host.call("sh", {}), (error) => error.code === "capability_disabled");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("ctx.workspace is the real path, so a symlinked workspace works with the file helpers", () =>
+  withTempDir(async (dir) => {
+    const real = path.join(dir, "real");
+    const link = path.join(dir, "link");
+    await fs.mkdir(real);
+    await fs.symlink(real, link);
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: link, ...quiet });
+    try {
+      await create(host, "w", "await ctx.writeText(ctx.workspace + '/note.txt', 'x'); return ctx.readText('note.txt');");
+      assert.equal(await host.call("w", {}), "x");
+      await create(host, "b", "return 'x'.repeat(args.value.length);");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("maxResultBytes is an inclusive limit", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, maxResultBytes: 12, ...quiet });
+    try {
+      await create(host, "sized", "return 'x'.repeat(Number(args.value));");
+      assert.equal(await host.call("sized", { value: "10" }), "x".repeat(10), "10 chars + 2 quotes = 12 bytes");
+      await assert.rejects(host.call("sized", { value: "11" }), (error) => error.code === "result_too_large");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("fetchJson has a timeout, a size cap, model-readable errors, and can be disabled", () =>
+  withTempDir(async (dir) => {
+    const { createServer } = await import("node:http");
+    const server = createServer((req, res) => {
+      if (req.url === "/json") return res.end(JSON.stringify({ hello: "world" }));
+      if (req.url === "/text") return res.end("plain");
+      if (req.url === "/big") return res.end("x".repeat(5000));
+      if (req.url === "/slow") return setTimeout(() => res.end("late"), 2000);
+      res.statusCode = 404;
+      res.end("nope");
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, maxResultBytes: 4000, ...quiet });
+    try {
+      await create(host, "get", "return ctx.fetchJson(args.value, { timeoutMs: 300 });");
+      assert.deepEqual((await host.call("get", { value: `${base}/json` })).body, { hello: "world" });
+      const text = await host.call("get", { value: `${base}/text` });
+      assert.equal(text.body, "plain");
+      assert.equal(text.ok, true);
+      assert.equal((await host.call("get", { value: `${base}/missing` })).status, 404);
+      await assert.rejects(host.call("get", { value: `${base}/big` }), (error) => error.code === "fetch_too_large");
+      await assert.rejects(host.call("get", { value: `${base}/slow` }), (error) => error.code === "fetch_timeout");
+      await assert.rejects(host.call("get", { value: "not a url" }), (error) => error.code === "fetch_failed" && /not a url/.test(error.message));
+      await assert.rejects(host.call("get", { value: "http://127.0.0.1:1/" }), (error) => error.code === "fetch_failed");
+    } finally {
+      await host.stop();
+      server.close();
+    }
+    const offline = await createToolHost({ dir: path.join(dir, "host2"), workspace: dir, capabilities: { network: false }, ...quiet });
+    try {
+      await create(offline, "get", "return ctx.fetchJson(args.value);");
+      await assert.rejects(offline.call("get", { value: `${base}/json` }), (error) => error.code === "capability_disabled");
+    } finally {
+      await offline.stop();
+    }
+  }));
+
+test("stopping the worker also stops processes a tool spawned", { skip: process.platform === "win32" }, () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    let grandchild;
+    try {
+      await create(host, "spawn", "const { spawn } = await import('node:child_process'); const c = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']); return c.pid;");
+      grandchild = await host.call("spawn", {});
+      assert.ok(Number.isInteger(grandchild));
+      process.kill(grandchild, 0);
+      await host.worker.restart("test");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.throws(() => process.kill(grandchild, 0), /ESRCH/, "the grandchild died with the worker's process group");
+    } finally {
+      try {
+        process.kill(grandchild, "SIGKILL");
+      } catch {
+        // already gone, which is the point
+      }
+      await host.stop();
+    }
+  }));
+
+test("a live foreign pid in the lock file is respected", () =>
+  withTempDir(async (dir) => {
+    const { spawn } = await import("node:child_process");
+    const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    try {
+      await fs.mkdir(path.join(dir, "host"));
+      await fs.writeFile(path.join(dir, "host", ".lock"), String(other.pid));
+      await assert.rejects(createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet }), (error) => error.code === "dir_in_use");
+    } finally {
+      other.kill("SIGKILL");
+    }
+  }));
+
+test("a source larger than maxSourceBytes is refused before it is stored", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, maxSourceBytes: 200, ...quiet });
+    try {
+      await assert.rejects(create(host, "fat", `const s = "${"x".repeat(300)}"; return s.length;`), (error) => error.code === "invalid_source" && /limit is 200/.test(error.message));
+      assert.equal(host.history("fat").length, 0);
     } finally {
       await host.stop();
     }

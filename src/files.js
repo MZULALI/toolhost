@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -19,7 +20,7 @@ export function modulePath(modulesDir, name) {
 export async function writeModule(modulesDir, tool) {
   await fs.mkdir(modulesDir, { recursive: true });
   const target = modulePath(modulesDir, tool.name);
-  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  const temp = `${target}.${randomUUID()}.tmp`; // unique even for same-tool writes in one tick
   await fs.writeFile(temp, tool.moduleSource, "utf8");
   await fs.rename(temp, target);
   return target;

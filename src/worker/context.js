@@ -9,14 +9,6 @@ const execAsync = promisify(execCallback);
 /** Environment variables a shell needs to function. Nothing else reaches `ctx.exec`. */
 const BASE_ENV_KEYS = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TERM"];
 
-export const DEFAULT_CAPABILITIES = Object.freeze({
-  files: true,
-  network: true,
-  exec: false,
-  shell: "/bin/sh",
-  execEnv: {}
-});
-
 /**
  * Build the `ctx` object handed to a tool's `execute(args, ctx)`.
  *
@@ -25,9 +17,16 @@ export const DEFAULT_CAPABILITIES = Object.freeze({
  * this is a sandbox: a tool runs with the worker process's OS permissions and can do
  * anything Node can do.
  *
- * @param {{ toolName: string, workspace: string, capabilities: typeof DEFAULT_CAPABILITIES, callTool: (name: string, args: unknown, stack: string[]) => Promise<unknown>, stack?: string[] }} options
+ * @param {{
+ *   toolName: string,
+ *   workspace: string,
+ *   capabilities: import("../capabilities.js").DEFAULT_CAPABILITIES,
+ *   maxResultBytes: number,
+ *   callTool: (name: string, args: unknown, stack: string[]) => Promise<unknown>,
+ *   stack?: string[]
+ * }} options
  */
-export function createContext({ toolName, workspace, capabilities, callTool, stack = [] }) {
+export function createContext({ toolName, workspace, capabilities, maxResultBytes, callTool, stack = [] }) {
   const inside = (inputPath) => resolveInside(workspace, inputPath);
   const requireCapability = (name, member) => {
     if (!capabilities[name]) {
@@ -60,7 +59,7 @@ export function createContext({ toolName, workspace, capabilities, callTool, sta
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.writeFile(target, String(content), "utf8");
       });
-      return { path: await relativeToWorkspace(workspace, target) };
+      return { path: path.relative(workspace, target) };
     },
 
     async appendText(filePath, content) {
@@ -70,7 +69,7 @@ export function createContext({ toolName, workspace, capabilities, callTool, sta
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.appendFile(target, String(content), "utf8");
       });
-      return { path: await relativeToWorkspace(workspace, target) };
+      return { path: path.relative(workspace, target) };
     },
 
     async listFiles(dirPath = ".") {
@@ -80,10 +79,22 @@ export function createContext({ toolName, workspace, capabilities, callTool, sta
       return entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "directory" : "file" }));
     },
 
-    async fetchJson(url, init = {}) {
+    /**
+     * `fetch` with a timeout, a response size cap, and errors the model can act on.
+     * @param {string} url
+     * @param {RequestInit & { timeoutMs?: number, maxBytes?: number }} [init]
+     */
+    async fetchJson(url, { timeoutMs = 30_000, maxBytes = maxResultBytes, ...init } = {}) {
       requireCapability("network", "fetchJson");
-      const response = await fetch(url, init);
-      const text = await response.text();
+      let response;
+      try {
+        response = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+      } catch (error) {
+        const cause = error.cause?.message ?? error.message;
+        const code = error.name === "TimeoutError" ? "fetch_timeout" : "fetch_failed";
+        throw new ToolError(code, `fetchJson(${url}) failed: ${cause}`, { url });
+      }
+      const text = await readBody(response, url, maxBytes);
       let body = text;
       try {
         body = JSON.parse(text);
@@ -136,9 +147,10 @@ export function createContext({ toolName, workspace, capabilities, callTool, sta
 /**
  * Resolve `inputPath` against `root` and refuse anything that leaves it, following
  * symlinks. The check is on the real path of the deepest existing ancestor, so a symlink
- * inside the workspace that points outside is rejected, whether the target exists yet or not.
+ * inside the workspace that points outside is rejected whether or not its target exists.
  *
- * @param {string} root @param {unknown} inputPath
+ * @param {string} root  The workspace; may itself be a symlink.
+ * @param {unknown} inputPath
  * @returns {Promise<string>} The real absolute path.
  */
 export async function resolveInside(root, inputPath) {
@@ -158,6 +170,9 @@ export async function resolveInside(root, inputPath) {
       real = await fs.realpath(existing);
     } catch (error) {
       if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw fileError(inputPath, error);
+      // A symlink whose target does not exist also fails realpath. It is not "a file that
+      // does not exist yet": writing to it would create the target, wherever that is.
+      if (await isSymlink(existing)) throw outside(inputPath);
       missing.unshift(path.basename(existing));
       const parent = path.dirname(existing);
       if (parent === existing) throw outside(inputPath);
@@ -167,6 +182,14 @@ export async function resolveInside(root, inputPath) {
     const resolved = path.join(real, ...missing);
     if (!isWithin(rootReal, resolved)) throw outside(inputPath);
     return resolved;
+  }
+}
+
+async function isSymlink(target) {
+  try {
+    return (await fs.lstat(target)).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 
@@ -196,8 +219,19 @@ async function fileOp(inputPath, run) {
   }
 }
 
-async function relativeToWorkspace(workspace, target) {
-  return path.relative(await fs.realpath(workspace), target);
+/** Read a response body as text, stopping as soon as it exceeds `maxBytes`. */
+async function readBody(response, url, maxBytes) {
+  if (!response.body) return "";
+  const chunks = [];
+  let received = 0;
+  for await (const chunk of response.body) {
+    received += chunk.byteLength;
+    if (received > maxBytes) {
+      throw new ToolError("fetch_too_large", `fetchJson(${url}) response exceeded ${maxBytes} bytes. Request less or stream to a file.`, { url });
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function pick(source, keys) {

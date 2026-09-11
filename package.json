@@ -23,7 +23,8 @@
   },
   "scripts": {
     "test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.js\"",
-    "check": "node --check src/*.js src/worker/*.js"
+    "check": "node --check src/*.js src/worker/*.js",
+    "typecheck": "tsc -p tests/types/tsconfig.json"
   },
   "dependencies": {
     "acorn": "^8.15.0"
@@ -48,5 +49,9 @@
   "bugs": {
     "url": "https://github.com/MZULALI/toolhost/issues"
   },
-  "homepage": "https://github.com/MZULALI/toolhost#readme"
+  "homepage": "https://github.com/MZULALI/toolhost#readme",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
 }
