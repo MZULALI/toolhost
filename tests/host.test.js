@@ -614,3 +614,43 @@ test("provider adapters produce each API's shape with the values intact", () =>
       await host.stop();
     }
   }));
+
+test("stop() racing a built-in tool call leaves no worker behind", () =>
+  withTempDir(async (dir) => {
+    for (const op of ["create", "update", "delete"]) {
+      const host = await createToolHost({ dir: path.join(dir, `host-${op}`), workspace: dir, ...quiet });
+      if (op !== "create") await create(host, "t", "return 1;");
+      const racing =
+        op === "create"
+          ? create(host, "t", "return 1;")
+          : op === "update"
+            ? host.call("update_tool", { name: "t", execute_source: "return 2;" })
+            : host.call("delete_tool", { name: "t" });
+      await host.stop();
+      const outcome = await racing.then(() => "ok", (error) => error.code);
+      assert.ok(outcome === "ok" || outcome === "worker_unavailable", `${op}: ${outcome}`);
+      assert.equal(host.status().worker.pid, null, `${op}: no worker after stop`);
+      assert.equal(host.status().open, false);
+      const again = await createToolHost({ dir: path.join(dir, `host-${op}`), workspace: dir, ...quiet });
+      await again.stop();
+    }
+  }));
+
+test("option validation covers non-numeric options; history() validates and stays typed", () =>
+  withTempDir(async (dir) => {
+    for (const bad of [{ onLog: "x" }, { onLog: null }, { workspace: 42 }, { capabilities: null }, { autoRestart: "yes" }]) {
+      assert.throws(() => new ToolHost({ dir: path.join(dir, "h"), workspace: dir, ...bad }), (error) => error.code === "invalid_argument", JSON.stringify(bad));
+    }
+    const host = await createToolHost({ dir: path.join(dir, "h"), workspace: dir, ...quiet });
+    try {
+      assert.throws(() => host.history("x", { limit: "x" }), (error) => error.code === "invalid_argument");
+      assert.throws(() => host.history("x", { limit: -1 }), (error) => error.code === "invalid_argument");
+      assert.throws(() => host.history("x", { before: 1.5 }), (error) => error.code === "invalid_argument");
+      assert.deepEqual(host.history("x"), []);
+      await assert.rejects(host.call("read_tool", { name: "nosuch", include_source: false, include_history: true, history_before: 5 }), (error) => error.code === "not_found");
+      await create(host, "f", "return ctx.fetchJson('http://127.0.0.1:1/', { signal: 'x' });");
+      await assert.rejects(host.call("f", {}), (error) => error.code === "invalid_argument");
+    } finally {
+      await host.stop();
+    }
+  }));

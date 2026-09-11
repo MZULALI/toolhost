@@ -85,6 +85,12 @@ export function createContext({ toolName, workspace, denied = [], capabilities, 
      */
     async fetchJson(url, { timeoutMs = 30_000, maxBytes = maxResultBytes, ...init } = {}) {
       requireCapability("network", "fetchJson");
+      if (init.signal !== undefined && !(init.signal instanceof AbortSignal)) {
+        throw new ToolError("invalid_argument", "fetchJson: signal must be an AbortSignal.");
+      }
+      if (!(Number.isInteger(timeoutMs) && timeoutMs > 0) || !(Number.isInteger(maxBytes) && maxBytes > 0)) {
+        throw new ToolError("invalid_argument", "fetchJson: timeoutMs and maxBytes must be positive integers.");
+      }
       const signals = [AbortSignal.timeout(timeoutMs), init.signal].filter(Boolean);
       let response;
       try {

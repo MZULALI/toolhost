@@ -144,7 +144,9 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 
 ### Worker events
 
-`host.worker` is an `EventEmitter`: `ready`, `exit`, `log`, `warning` (an unhandled rejection or uncaught exception inside a tool), `restarting` (after a crash, with the backoff delay), `unhealthy` (after `maxCrashRestarts` consecutive crashes; call `restart()` to try again).
+`host.worker` is an `EventEmitter`: `ready`, `exit`, `log`, `warning` (an unhandled rejection or uncaught exception inside a tool), `startup_error`, `restarting` (after a crash, with the backoff delay), `unhealthy` (after `maxCrashRestarts` consecutive crashes; call `restart()` to try again).
+
+The tool names in `status().worker.tools` are reported by the worker itself. A tool can lie about them, since it shares the worker's IPC channel; treat `status()` as operational, not as a security boundary. `details.remoteStack` on a `call_failed` error contains the worker's file paths, by design, so the model can locate its own bug.
 
 ### Adapters
 
@@ -169,7 +171,7 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 ## Development
 
 ```sh
-npm test          # node --test, 57 tests, loopback only, a few seconds
+npm test          # node --test, 61 tests, loopback only, a few seconds
 npm run check     # syntax check
 npm run typecheck # tsc --strict over a consumer of every export
 ```

@@ -58,3 +58,12 @@ test("does not mutate its input", () => {
   normalizeToolSchema(input);
   assert.equal("required" in input, false);
 });
+
+test("a densely shared schema graph normalises in linear time", () => {
+  let node = { type: "object", properties: { leaf: { type: "string" } } };
+  for (let i = 0; i < 40; i += 1) node = { type: "object", properties: { a: node, b: node } };
+  const started = Date.now();
+  const schema = normalizeToolSchema(node);
+  assert.ok(Date.now() - started < 500, "exponential walks would take hours here");
+  assert.equal(schema.properties.a.properties.b.additionalProperties, false);
+});

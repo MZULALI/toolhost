@@ -27,3 +27,15 @@ test("callTool before start rejects immediately, not after a timeout", () =>
     await assert.rejects(client.callTool("x", {}), (error) => error.code === "worker_unavailable");
     assert.ok(Date.now() - started < 500);
   }));
+
+test("a raw errno during worker startup arrives as startup_failed without the host path", () =>
+  withTempDir(async (dir) => {
+    const modulesDir = path.join(dir, "modules");
+    await fs.writeFile(modulesDir, "not a directory");
+    const client = new ToolWorkerClient({ config: { dir, dbPath: path.join(dir, "t.sqlite"), modulesDir, workspace: dir } });
+    await assert.rejects(
+      client.restart("test"),
+      (error) => error.code === "startup_failed" && !error.message.includes(dir) && typeof error.details.remoteCode === "string"
+    );
+    await client.stop();
+  }));

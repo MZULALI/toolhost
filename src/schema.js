@@ -30,30 +30,8 @@ export function normalizeToolSchema(input) {
   if (!isObjectSchema(cloned)) {
     throw new ToolError("invalid_schema", 'The top-level parameters schema must have type "object".');
   }
-  normalizeNode(cloned, 0);
+  normalizeNode(cloned, 0, new Set());
   return cloned;
-}
-
-/** Deeper than any real schema; stops cycles and stack overflows. */
-const MAX_DEPTH = 64;
-
-/**
- * Iterative walk, so a hostile input cannot overflow the stack before it is judged. Only
- * ancestors count as a cycle; the same subschema reused in two places is fine.
- */
-function assertBounded(root) {
-  const stack = [[root, []]];
-  while (stack.length) {
-    const [node, ancestors] = stack.pop();
-    if (!node || typeof node !== "object") continue;
-    if (ancestors.includes(node)) throw new ToolError("invalid_schema", "parameters schema contains a cycle.");
-    // Each schema level is two object levels (`properties` wrapper plus the property).
-    if (ancestors.length > MAX_DEPTH * 2) {
-      throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} schema levels deep.`);
-    }
-    const next = [...ancestors, node];
-    for (const child of Object.values(node)) stack.push([child, next]);
-  }
 }
 
 function isPlainObject(value) {
@@ -66,8 +44,45 @@ function isObjectSchema(node) {
   return Array.isArray(node.type) && node.type.includes("object");
 }
 
-function normalizeNode(node, depth) {
-  if (!isPlainObject(node)) return;
+/** Deeper than any real schema; stops cycles and stack overflows. */
+const MAX_DEPTH = 64;
+
+/**
+ * Iterative three-colour DFS, so a hostile input cannot overflow the stack before it is
+ * judged. A node on the current path (grey) is a cycle; a finished node (black) is a
+ * shared subschema and is skipped, which keeps the walk linear.
+ */
+function assertBounded(root) {
+  const grey = new Set();
+  const black = new Set();
+  const stack = [{ node: root, depth: 0, entered: false }];
+  while (stack.length) {
+    const frame = stack.at(-1);
+    const { node, depth } = frame;
+    if (!node || typeof node !== "object" || black.has(node)) {
+      stack.pop();
+      continue;
+    }
+    if (frame.entered) {
+      grey.delete(node);
+      black.add(node);
+      stack.pop();
+      continue;
+    }
+    if (grey.has(node)) throw new ToolError("invalid_schema", "parameters schema contains a cycle.");
+    // Each schema level is two object levels (`properties` wrapper plus the property).
+    if (depth > MAX_DEPTH * 2) {
+      throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} schema levels deep.`);
+    }
+    frame.entered = true;
+    grey.add(node);
+    for (const child of Object.values(node)) stack.push({ node: child, depth: depth + 1, entered: false });
+  }
+}
+
+function normalizeNode(node, depth, done) {
+  if (!isPlainObject(node) || done.has(node)) return;
+  done.add(node);
   if (depth > MAX_DEPTH) {
     throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} schema levels deep.`);
   }
@@ -78,12 +93,12 @@ function normalizeNode(node, depth) {
       ? node.required.filter((key) => Object.hasOwn(node.properties, key))
       : [];
     node.additionalProperties = false;
-    for (const child of Object.values(node.properties)) normalizeNode(child, depth + 1);
+    for (const child of Object.values(node.properties)) normalizeNode(child, depth + 1, done);
   }
 
   for (const key of ["items", "prefixItems", "anyOf", "oneOf", "allOf"]) {
     const value = node[key];
-    if (Array.isArray(value)) value.forEach((child) => normalizeNode(child, depth + 1));
-    else if (value) normalizeNode(value, depth + 1);
+    if (Array.isArray(value)) value.forEach((child) => normalizeNode(child, depth + 1, done));
+    else if (value) normalizeNode(value, depth + 1, done);
   }
 }

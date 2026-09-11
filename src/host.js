@@ -26,6 +26,8 @@ export class ToolHost {
   #modulesDir;
   #maxSourceBytes;
   #onLog;
+  /** Built-in tool calls in progress; stop() waits for them so a late restart cannot outlive it. */
+  #coreCalls = new Set();
 
   /**
    * @param {{
@@ -60,6 +62,14 @@ export class ToolHost {
     if (!dir) throw new ToolError("invalid_argument", "ToolHost requires a `dir` to store its database and modules.");
     assertPositiveInteger({ callTimeoutMs, readyTimeoutMs, killGraceMs, drainTimeoutMs, maxResultBytes, maxSourceBytes });
     assertNonNegativeInteger({ maxCrashRestarts });
+    if (typeof workspace !== "string" || typeof dir !== "string") {
+      throw new ToolError("invalid_argument", "dir and workspace must be strings.");
+    }
+    if (typeof onLog !== "function") throw new ToolError("invalid_argument", "onLog must be a function.");
+    if (!capabilities || typeof capabilities !== "object") throw new ToolError("invalid_argument", "capabilities must be an object.");
+    if (autoRestart !== undefined && typeof autoRestart !== "boolean") {
+      throw new ToolError("invalid_argument", "autoRestart must be a boolean.");
+    }
     this.dir = path.resolve(dir);
     this.workspace = path.resolve(workspace);
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...capabilities };
@@ -119,6 +129,7 @@ export class ToolHost {
   async stop() {
     if (!this.#open) return;
     this.#open = false;
+    await Promise.allSettled([...this.#coreCalls]);
     await this.worker.stop("stop");
     this.store.close();
     this.store = null;
@@ -144,14 +155,16 @@ export class ToolHost {
       this.#assertOpen();
       if (typeof name !== "string") throw new ToolError("invalid_name", "Tool name must be a string.");
       const input = args && typeof args === "object" ? args : {};
-      if (isCoreTool(name)) return await this.#callCore(name.toLowerCase(), input);
-      return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
-    } catch (error) {
-      if (error instanceof ToolError) throw error;
-      if (error?.code === "ERR_SQLITE_ERROR") {
-        throw new ToolError("store_error", `The tool store rejected the change: ${error.message}`, { cause: error });
+      if (!isCoreTool(name)) return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
+      const pending = this.#callCore(name.toLowerCase(), input);
+      this.#coreCalls.add(pending);
+      try {
+        return await pending;
+      } finally {
+        this.#coreCalls.delete(pending);
       }
-      throw new ToolError("internal_error", `toolhost failed unexpectedly: ${error?.message ?? error}`, { cause: error });
+    } catch (error) {
+      throw asToolError(error);
     }
   }
 
@@ -159,9 +172,14 @@ export class ToolHost {
    * Previous versions of a tool, newest first. Includes deleted tools.
    * @param {string} name @param {{ limit?: number, before?: number }} [options]
    */
-  history(name, options = {}) {
-    this.#assertOpen();
-    return this.registry.history(name, options);
+  history(name, { limit = 20, before } = {}) {
+    try {
+      this.#assertOpen();
+      assertPositiveInteger({ limit });
+      return this.registry.history(name, { limit, before: optionalVersionId(before) });
+    } catch (error) {
+      throw asToolError(error);
+    }
   }
 
   status() {
@@ -246,7 +264,9 @@ export class ToolHost {
           const more = oldest ? this.registry.history(toolName, { limit: 1, before: oldest.id }).length > 0 : false;
           result.history_truncated = more;
           if (more) result.history_next_before = oldest.id;
-          if (!tool && !page.length && before === undefined) throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
+          if (!tool && this.registry.historyCount(toolName) === 0) {
+            throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
+          }
         } else if (!tool) {
           throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
         }
@@ -327,6 +347,15 @@ function assertNonNegativeInteger(options) {
       throw new ToolError("invalid_argument", `${key} must be a non-negative integer, got ${JSON.stringify(value)}.`);
     }
   }
+}
+
+/** Every rejection from the public surface is a ToolError. */
+function asToolError(error) {
+  if (error instanceof ToolError) return error;
+  if (error?.code === "ERR_SQLITE_ERROR") {
+    return new ToolError("store_error", `The tool store rejected the operation: ${error.message}`, { cause: error });
+  }
+  return new ToolError("internal_error", `toolhost failed unexpectedly: ${error?.message ?? error}`, { cause: error });
 }
 
 /** Anything that is not already a ToolError becomes one, with the sentence a misconfiguration needs. */

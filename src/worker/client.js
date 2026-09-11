@@ -14,6 +14,9 @@ const WORKER_PATH = fileURLToPath(new URL("./main.js", import.meta.url));
  * `details.remoteCode`, so an application's `switch (error.code)` cannot be steered by
  * model-written code.
  */
+/** Startup failures the worker may name; anything else (a raw errno) is `startup_failed`. */
+const STARTUP_CODES = new Set(["store_incompatible", "invalid_source"]);
+
 const WORKER_CODES = new Set([
   "not_found",
   "invalid_name",
@@ -54,6 +57,8 @@ export class ToolWorkerClient extends EventEmitter {
   #tools = [];
   #pending = new Map();
   #restarting = false;
+  /** Bumped by stop(); a restart queued before a stop must not fork after it. */
+  #stopGeneration = 0;
   #restartCount = 0;
   #crashes = 0;
   #lastExit = null;
@@ -111,8 +116,12 @@ export class ToolWorkerClient extends EventEmitter {
    */
   restart(reason = "manual") {
     if (this.#scheduled) return this.#scheduled;
+    const generation = this.#stopGeneration;
     const task = this.#queue.then(() => {
       this.#scheduled = null;
+      if (generation !== this.#stopGeneration) {
+        throw new ToolError("worker_unavailable", "Worker was stopped before this restart could run.");
+      }
       return this.#restartNow(reason);
     });
     this.#scheduled = task;
@@ -126,6 +135,7 @@ export class ToolWorkerClient extends EventEmitter {
    */
   async stop(reason = "stop") {
     this.#stopped = true;
+    this.#stopGeneration += 1;
     this.#cancelCrashRestart();
     await this.#queue;
     await this.#drain();
@@ -296,8 +306,12 @@ export class ToolWorkerClient extends EventEmitter {
         cleanup();
         resolve();
       };
-      const onStartupError = (error) =>
-        fail("startup-error", new ToolError(error?.code ?? "startup_failed", `Worker failed to start: ${error?.message ?? "unknown error"}`));
+      const onStartupError = (error) => {
+        const remoteCode = error?.code;
+        const code = STARTUP_CODES.has(remoteCode) ? remoteCode : "startup_failed";
+        const message = code === remoteCode ? error.message : `Worker failed to start (${remoteCode ?? "unknown error"}).`;
+        fail("startup-error", new ToolError(code, message, { remoteCode, remoteMessage: error?.message }));
+      };
       const onExit = () => {
         cleanup();
         reject(new ToolError("worker_unavailable", "Worker exited during startup."));
