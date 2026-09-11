@@ -75,6 +75,7 @@ async function main(): Promise<void> {
     await registry.delete("a");
     store.findCollision("a");
     store.getVersion("a", 1);
+    console.log(store.history("a", { before: 5, limit: 3 }).length, registry.historyCount("a"), host.history("a", { before: 1 }));
     console.log(registry.list({ includeSource: true })[0]?.executeSource);
   }
   await client.restart("x");
@@ -86,7 +87,7 @@ async function main(): Promise<void> {
   console.log(caps.shell, err.code, err.details, isCoreTool("x"), RESERVED_NAMES[0], TOOL_NAME_PATTERN.source);
   console.log(assertToolName("a"), assertUserToolName("a"), unwrapExecuteSource("return 1;"));
   assertModuleSource(buildModuleSource({ name: "a", description: "d", parameters: {}, executeSource: "return 1;" }));
-  console.log(normalizeToolSchema({ type: "object" }), await resolveInside("/", "x"), coreTools.length);
+  console.log(normalizeToolSchema({ type: "object" }), await resolveInside("/", "x", { denied: ["/tmp"] }), coreTools.length);
 }
 
 void main;

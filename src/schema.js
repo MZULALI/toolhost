@@ -37,19 +37,22 @@ export function normalizeToolSchema(input) {
 /** Deeper than any real schema; stops cycles and stack overflows. */
 const MAX_DEPTH = 64;
 
-/** Iterative walk, so a hostile input cannot overflow the stack before it is judged. */
+/**
+ * Iterative walk, so a hostile input cannot overflow the stack before it is judged. Only
+ * ancestors count as a cycle; the same subschema reused in two places is fine.
+ */
 function assertBounded(root) {
-  const stack = [[root, 0]];
-  const seen = new Set();
+  const stack = [[root, []]];
   while (stack.length) {
-    const [node, depth] = stack.pop();
+    const [node, ancestors] = stack.pop();
     if (!node || typeof node !== "object") continue;
-    if (seen.has(node)) throw new ToolError("invalid_schema", "parameters schema contains a cycle.");
-    if (depth > MAX_DEPTH) {
-      throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} levels deep.`);
+    if (ancestors.includes(node)) throw new ToolError("invalid_schema", "parameters schema contains a cycle.");
+    // Each schema level is two object levels (`properties` wrapper plus the property).
+    if (ancestors.length > MAX_DEPTH * 2) {
+      throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} schema levels deep.`);
     }
-    seen.add(node);
-    for (const child of Object.values(node)) stack.push([child, depth + 1]);
+    const next = [...ancestors, node];
+    for (const child of Object.values(node)) stack.push([child, next]);
   }
 }
 
@@ -66,7 +69,7 @@ function isObjectSchema(node) {
 function normalizeNode(node, depth) {
   if (!isPlainObject(node)) return;
   if (depth > MAX_DEPTH) {
-    throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} levels deep (or contains a cycle).`);
+    throw new ToolError("invalid_schema", `parameters schema is nested more than ${MAX_DEPTH} schema levels deep.`);
   }
 
   if (isObjectSchema(node)) {

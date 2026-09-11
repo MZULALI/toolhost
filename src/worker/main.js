@@ -19,12 +19,15 @@ const capabilities = { ...DEFAULT_CAPABILITIES, ...(config.capabilities ?? {}) }
 const maxResultBytes = config.maxResultBytes ?? 1_000_000;
 /** Resolved once so `ctx.workspace` and the confinement check agree even when the workspace is a symlink. */
 let workspace = config.workspace;
+/** toolhost's own directory, real path. Tools may not read or write it even if it sits inside the workspace. */
+let denied = [];
 
 /** @type {Map<string, { execute: Function }>} */
 const tools = new Map();
 
 async function loadTools() {
   workspace = await fs.realpath(config.workspace);
+  denied = [await fs.realpath(config.dir)];
   const store = new ToolStore(config.dbPath);
   try {
     await syncModules(store, config.modulesDir);
@@ -43,7 +46,7 @@ async function loadTools() {
 async function runTool(name, args, stack = []) {
   const tool = tools.get(name);
   if (!tool) throw new ToolError("not_found", `Unknown tool: ${name}`);
-  const ctx = createContext({ toolName: name, workspace, capabilities, maxResultBytes, callTool: runTool, stack });
+  const ctx = createContext({ toolName: name, workspace, denied, capabilities, maxResultBytes, callTool: runTool, stack });
   return tool.execute(args ?? {}, ctx);
 }
 

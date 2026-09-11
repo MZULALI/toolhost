@@ -20,14 +20,15 @@ const BASE_ENV_KEYS = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TERM"];
  * @param {{
  *   toolName: string,
  *   workspace: string,
+ *   denied?: string[],
  *   capabilities: import("../capabilities.js").DEFAULT_CAPABILITIES,
  *   maxResultBytes: number,
  *   callTool: (name: string, args: unknown, stack: string[]) => Promise<unknown>,
  *   stack?: string[]
  * }} options
  */
-export function createContext({ toolName, workspace, capabilities, maxResultBytes, callTool, stack = [] }) {
-  const inside = (inputPath) => resolveInside(workspace, inputPath);
+export function createContext({ toolName, workspace, denied = [], capabilities, maxResultBytes, callTool, stack = [] }) {
+  const inside = (inputPath) => resolveInside(workspace, inputPath, { denied });
   const requireCapability = (name, member) => {
     if (!capabilities[name]) {
       throw new ToolError("capability_disabled", `ctx.${member} is disabled by the host.`);
@@ -48,34 +49,32 @@ export function createContext({ toolName, workspace, capabilities, maxResultByte
 
     async readText(filePath) {
       requireCapability("files", "readText");
-      const target = await inside(filePath);
-      return fileOp(filePath, () => fs.readFile(target, "utf8"));
+      return fileOp(filePath, async () => fs.readFile(await inside(filePath), "utf8"));
     },
 
     async writeText(filePath, content) {
       requireCapability("files", "writeText");
-      const target = await inside(filePath);
-      await fileOp(filePath, async () => {
+      return fileOp(filePath, async () => {
+        const target = await inside(filePath);
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.writeFile(target, String(content), "utf8");
+        return { path: path.relative(workspace, target) };
       });
-      return { path: path.relative(workspace, target) };
     },
 
     async appendText(filePath, content) {
       requireCapability("files", "appendText");
-      const target = await inside(filePath);
-      await fileOp(filePath, async () => {
+      return fileOp(filePath, async () => {
+        const target = await inside(filePath);
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.appendFile(target, String(content), "utf8");
+        return { path: path.relative(workspace, target) };
       });
-      return { path: path.relative(workspace, target) };
     },
 
     async listFiles(dirPath = ".") {
       requireCapability("files", "listFiles");
-      const target = await inside(dirPath);
-      const entries = await fileOp(dirPath, () => fs.readdir(target, { withFileTypes: true }));
+      const entries = await fileOp(dirPath, async () => fs.readdir(await inside(dirPath), { withFileTypes: true }));
       return entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "directory" : "file" }));
     },
 
@@ -86,9 +85,10 @@ export function createContext({ toolName, workspace, capabilities, maxResultByte
      */
     async fetchJson(url, { timeoutMs = 30_000, maxBytes = maxResultBytes, ...init } = {}) {
       requireCapability("network", "fetchJson");
+      const signals = [AbortSignal.timeout(timeoutMs), init.signal].filter(Boolean);
       let response;
       try {
-        response = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+        response = await fetch(url, { ...init, signal: AbortSignal.any(signals) });
       } catch (error) {
         const cause = error.cause?.message ?? error.message;
         const code = error.name === "TimeoutError" ? "fetch_timeout" : "fetch_failed";
@@ -120,9 +120,12 @@ export function createContext({ toolName, workspace, capabilities, maxResultByte
         ...capabilities.execEnv,
         ...(options.env ?? {})
       };
+      // Resolved outside the try: a confinement failure is thrown, like every other helper,
+      // not returned as a failed command.
+      const cwd = options.cwd ? await fileOp(options.cwd, () => inside(options.cwd)) : workspace;
       try {
         const { stdout, stderr } = await execAsync(command, {
-          cwd: options.cwd ? await inside(options.cwd) : workspace,
+          cwd,
           timeout: options.timeoutMs ?? 30_000,
           maxBuffer: options.maxBuffer ?? 1024 * 1024,
           shell: capabilities.shell,
@@ -151,13 +154,19 @@ export function createContext({ toolName, workspace, capabilities, maxResultByte
  *
  * @param {string} root  The workspace; may itself be a symlink.
  * @param {unknown} inputPath
+ * @param {{ denied?: string[] }} [options]  Directories inside the workspace that are off limits (toolhost's own `dir`).
  * @returns {Promise<string>} The real absolute path.
  */
-export async function resolveInside(root, inputPath) {
+export async function resolveInside(root, inputPath, { denied = [] } = {}) {
   if (typeof inputPath !== "string" || inputPath.includes("\0")) {
     throw new ToolError("invalid_path", "Path must be a string without NUL bytes.");
   }
-  const rootReal = await fs.realpath(root);
+  let rootReal;
+  try {
+    rootReal = await fs.realpath(root);
+  } catch (error) {
+    throw new ToolError("workspace_unavailable", `The workspace is no longer accessible (${error.code ?? "error"}).`);
+  }
   const lexical = path.resolve(rootReal, inputPath);
   if (!isWithin(rootReal, lexical)) throw outside(inputPath);
 
@@ -181,6 +190,11 @@ export async function resolveInside(root, inputPath) {
     }
     const resolved = path.join(real, ...missing);
     if (!isWithin(rootReal, resolved)) throw outside(inputPath);
+    for (const dir of denied) {
+      if (isWithin(dir, resolved)) {
+        throw new ToolError("path_outside_workspace", `Path is inside toolhost's own directory and off limits: ${inputPath}`);
+      }
+    }
     return resolved;
   }
 }

@@ -46,9 +46,17 @@ export class ToolRegistry {
     return tool;
   }
 
-  /** Previous versions, newest first, including deletions. @param {string} name */
-  history(name) {
-    return this.store.history(assertName(name));
+  /**
+   * Previous versions, newest first, including deletions.
+   * @param {string} name @param {{ limit?: number, before?: number }} [options]
+   */
+  history(name, options = {}) {
+    return this.store.history(assertName(name), options);
+  }
+
+  /** @param {string} name */
+  historyCount(name) {
+    return this.store.historyCount(assertName(name));
   }
 
   /**

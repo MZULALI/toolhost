@@ -46,6 +46,13 @@ test("cycles, absurd depth, and non-JSON values are invalid_schema, never a raw 
   assert.throws(() => normalizeToolSchema({ type: "object", properties: { f: { fn: () => 1 } } }), (error) => error.code === "invalid_schema");
 });
 
+test("a subschema shared in two places is not a cycle", () => {
+  const addr = { type: "object", properties: { street: { type: "string" } } };
+  const schema = normalizeToolSchema({ type: "object", properties: { home: addr, work: addr } });
+  assert.equal(schema.properties.home.additionalProperties, false);
+  assert.equal(schema.properties.work.additionalProperties, false);
+});
+
 test("does not mutate its input", () => {
   const input = { type: "object", properties: { a: { type: "string" } } };
   normalizeToolSchema(input);

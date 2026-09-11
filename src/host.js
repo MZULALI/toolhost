@@ -58,6 +58,8 @@ export class ToolHost {
     onLog = noop
   }) {
     if (!dir) throw new ToolError("invalid_argument", "ToolHost requires a `dir` to store its database and modules.");
+    assertPositiveInteger({ callTimeoutMs, readyTimeoutMs, killGraceMs, drainTimeoutMs, maxResultBytes, maxSourceBytes });
+    assertNonNegativeInteger({ maxCrashRestarts });
     this.dir = path.resolve(dir);
     this.workspace = path.resolve(workspace);
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...capabilities };
@@ -73,7 +75,7 @@ export class ToolHost {
     /** @type {ToolRegistry | null} */
     this.registry = null;
     this.worker = new ToolWorkerClient({
-      config: { dbPath: this.#dbPath, modulesDir: this.#modulesDir, workspace: this.workspace, capabilities: this.capabilities, maxResultBytes },
+      config: { dir: this.dir, dbPath: this.#dbPath, modulesDir: this.#modulesDir, workspace: this.workspace, capabilities: this.capabilities, maxResultBytes },
       readyTimeoutMs,
       killGraceMs,
       drainTimeoutMs,
@@ -87,11 +89,15 @@ export class ToolHost {
   /** Lock the directory, open the store, sync modules, start the worker. Idempotent. */
   async start() {
     if (this.#open) return this;
-    fs.mkdirSync(this.dir, { recursive: true });
-    if (!fs.existsSync(this.workspace)) {
-      throw new ToolError("invalid_argument", `workspace does not exist: ${this.workspace}`);
+    try {
+      fs.mkdirSync(this.dir, { recursive: true });
+      if (!fs.existsSync(this.workspace)) {
+        throw new ToolError("invalid_argument", `workspace does not exist: ${this.workspace}`);
+      }
+      acquireLock(this.#lockPath);
+    } catch (error) {
+      throw asStartError(error, this.dir);
     }
-    acquireLock(this.#lockPath);
     try {
       this.store = new ToolStore(this.#dbPath);
       this.registry = new ToolRegistry({ store: this.store, modulesDir: this.#modulesDir, maxSourceBytes: this.#maxSourceBytes });
@@ -103,7 +109,7 @@ export class ToolHost {
       this.store = null;
       this.registry = null;
       releaseLock(this.#lockPath);
-      throw error;
+      throw asStartError(error, this.dir);
     }
     this.#open = true;
     return this;
@@ -142,14 +148,20 @@ export class ToolHost {
       return await this.worker.callTool(name, input, { timeoutMs: this.callTimeoutMs });
     } catch (error) {
       if (error instanceof ToolError) throw error;
+      if (error?.code === "ERR_SQLITE_ERROR") {
+        throw new ToolError("store_error", `The tool store rejected the change: ${error.message}`, { cause: error });
+      }
       throw new ToolError("internal_error", `toolhost failed unexpectedly: ${error?.message ?? error}`, { cause: error });
     }
   }
 
-  /** Previous versions of a tool, newest first. Includes deleted tools. @param {string} name */
-  history(name) {
+  /**
+   * Previous versions of a tool, newest first. Includes deleted tools.
+   * @param {string} name @param {{ limit?: number, before?: number }} [options]
+   */
+  history(name, options = {}) {
     this.#assertOpen();
-    return this.registry.history(name);
+    return this.registry.history(name, options);
   }
 
   status() {
@@ -225,10 +237,19 @@ export class ToolHost {
         const toolName = assertUserToolName(args.name);
         const includeSource = Boolean(args.include_source);
         const tool = this.store.get(toolName, { includeSource });
-        const history = args.include_history ? this.registry.history(toolName).map(publicVersion) : null;
-        if (!tool && !history?.length) throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
         const result = { ok: true, tool: tool ? publicTool(tool, includeSource) : null };
-        if (history) result.history = history;
+        if (args.include_history) {
+          const before = optionalVersionId(args.history_before);
+          const page = this.registry.history(toolName, { limit: HISTORY_PAGE, before });
+          result.history = page.map((version) => publicVersion(version, includeSource));
+          const oldest = page.at(-1);
+          const more = oldest ? this.registry.history(toolName, { limit: 1, before: oldest.id }).length > 0 : false;
+          result.history_truncated = more;
+          if (more) result.history_next_before = oldest.id;
+          if (!tool && !page.length && before === undefined) throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
+        } else if (!tool) {
+          throw new ToolError("not_found", `Tool "${toolName}" does not exist.`);
+        }
         return result;
       }
       default:
@@ -278,15 +299,41 @@ function publicTool(tool, includeSource = false) {
   };
 }
 
-function publicVersion(version) {
+function publicVersion(version, includeSource) {
   return {
     version: version.id,
     operation: version.operation,
     createdAt: version.createdAt,
     enabled: version.enabled,
     description: version.description,
-    execute_source: version.executeSource
+    ...(includeSource ? { execute_source: version.executeSource } : {})
   };
+}
+
+/** History rows per `read_tool` call. The model pages with `history_before`. */
+const HISTORY_PAGE = 20;
+
+function assertPositiveInteger(options) {
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined && !(Number.isInteger(value) && value > 0)) {
+      throw new ToolError("invalid_argument", `${key} must be a positive integer, got ${JSON.stringify(value)}.`);
+    }
+  }
+}
+
+function assertNonNegativeInteger(options) {
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined && !(Number.isInteger(value) && value >= 0)) {
+      throw new ToolError("invalid_argument", `${key} must be a non-negative integer, got ${JSON.stringify(value)}.`);
+    }
+  }
+}
+
+/** Anything that is not already a ToolError becomes one, with the sentence a misconfiguration needs. */
+function asStartError(error, dir) {
+  if (error instanceof ToolError) return error;
+  const detail = error?.code ? `${error.code}: ${error.message}` : String(error?.message ?? error);
+  return new ToolError("start_failed", `ToolHost could not start in ${dir}. ${detail}`, { cause: error });
 }
 
 /**

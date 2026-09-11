@@ -57,6 +57,10 @@ export type ToolErrorCode =
   | "invalid_argument"
   | "invalid_path"
   | "internal_error"
+  | "start_failed"
+  | "store_error"
+  | "store_incompatible"
+  | "workspace_unavailable"
   | "exists"
   | "not_found"
   | "recursive_call"
@@ -160,8 +164,8 @@ export class ToolHost {
   tools(): ToolDefinition[];
   /** Run a tool the model chose. Rejects with `ToolError`. */
   call(name: string, args?: Record<string, unknown>): Promise<unknown>;
-  /** Previous versions of a tool, newest first. */
-  history(name: string): ToolVersion[];
+  /** Previous versions of a tool, newest first. Includes deleted tools. `before` pages further back. */
+  history(name: string, options?: { limit?: number; before?: number }): ToolVersion[];
   status(): HostStatus;
 }
 
@@ -191,7 +195,8 @@ export class ToolRegistry {
   list(options?: { includeDisabled?: boolean; includeSource?: boolean }): Tool[];
   definitions(): ToolDefinition[];
   read(name: string, options?: { includeSource?: boolean }): Tool;
-  history(name: string): ToolVersion[];
+  history(name: string, options?: { limit?: number; before?: number }): ToolVersion[];
+  historyCount(name: string): number;
   create(input: CreateToolInput): Promise<Tool & { versionId: number }>;
   update(input: UpdateToolInput): Promise<Tool & { versionId: number }>;
   /** Make a previous version current again. Works for deleted tools. */
@@ -217,12 +222,15 @@ export class ToolStore {
   findCollision(name: string): string | null;
   save(tool: StoredToolInput, operation: "create" | "update" | "restore"): Tool & { versionId: number };
   remove(name: string): (Tool & { versionId: number }) | null;
-  history(name: string, options?: { limit?: number }): ToolVersion[];
+  history(name: string, options?: { limit?: number; before?: number }): ToolVersion[];
+  historyCount(name: string): number;
   getVersion(name: string, versionId: number): ToolVersion | null;
   close(): void;
 }
 
 export interface WorkerConfig {
+  /** toolhost's own directory; tools may not touch it even if it is inside the workspace. */
+  dir: string;
   dbPath: string;
   modulesDir: string;
   workspace: string;
@@ -263,6 +271,7 @@ export class ToolWorkerClient extends EventEmitter<ToolWorkerClientEvents> {
   status(): WorkerStatus;
   /** Serialised and coalesced; waits for in-flight calls to drain first. */
   restart(reason?: string): Promise<WorkerStatus>;
+  /** Waits for in-flight calls (up to drainTimeoutMs), then terminates the worker. */
   stop(reason?: string): Promise<void>;
   /** Waits for any restart in progress, then runs the tool in the worker. */
   callTool(name: string, args: unknown, options?: { timeoutMs?: number }): Promise<unknown>;
@@ -290,5 +299,5 @@ export const TOOL_NAME_PATTERN: RegExp;
 export function assertToolName(name: unknown): string;
 /** As `assertToolName`, and also rejects the built-in tool names. */
 export function assertUserToolName(name: unknown): string;
-/** Resolve a path inside `root` by real path; rejects lexical escapes, symlinks that lead out, and dangling symlinks. */
-export function resolveInside(root: string, inputPath: unknown): Promise<string>;
+/** Resolve a path inside `root` by real path; rejects lexical escapes, symlinks that lead out, dangling symlinks, and `denied` directories. */
+export function resolveInside(root: string, inputPath: unknown, options?: { denied?: string[] }): Promise<string>;

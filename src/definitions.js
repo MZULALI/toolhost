@@ -63,8 +63,12 @@ export const coreTools = Object.freeze([
     parameters: objectSchema(
       {
         name: { type: "string", description: "Tool name." },
-        include_source: { type: "boolean", description: "Include execute_source." },
-        include_history: { type: "boolean", description: "Include previous versions, newest first, with their source." }
+        include_source: { type: "boolean", description: "Include execute_source, for the current version and for history rows." },
+        include_history: { type: "boolean", description: "Include previous versions, newest first (20 per page)." },
+        history_before: {
+          type: "integer",
+          description: "Page further back: return history versions older than this version id."
+        }
       },
       ["name", "include_source"]
     )

@@ -65,7 +65,7 @@ Five built-in tools, exported as `coreTools`:
 | `update_tool` | Change any field, disable and re-enable, or `restore_version` from history. Omitted fields keep their value. |
 | `delete_tool` | Remove a tool. Returns the `restore_version` that undoes it. |
 | `list_tools` | List generated tools. |
-| `read_tool` | Read a tool's schema and, optionally, its source and version history. Works on deleted tools with `include_history`. |
+| `read_tool` | Read a tool's schema and, optionally, its source and version history, 20 versions a page with `history_before` to go further back. Works on deleted tools. |
 
 The implementation the model writes is the body of `async function execute(args, ctx)`. If it sends the whole function, an exported one, or `const execute = async () => {}`, toolhost unwraps it. Inside, `ctx` offers:
 
@@ -81,6 +81,8 @@ Results must be JSON. Anything else is rejected with `unserializable_result`, an
 
 A tool's `console.log` and any unhandled rejection inside it go to the `onLog` option. Nothing is printed unless you pass one.
 
+A tool can only assert the error codes the `ctx` helpers raise. Anything else it throws, including an invented code or a raw `ENOENT` from its own file access, reaches you as `call_failed` with the original in `details.remoteCode`, so model-written code cannot steer your `switch (error.code)`.
+
 ## Security
 
 **toolhost is not a sandbox.** Generated code runs in a child Node process with the same OS user, permissions, and network access as the parent. The worker gives you fault isolation: a tool that crashes, leaks memory, or spins forever cannot take your process down. It gives you nothing against a tool that decides to `import("node:fs")` and read your home directory, or to `import("node:child_process")` and run whatever it likes. If the model talks to untrusted users, put the whole process in a container or VM. The `dir` and `workspace` you pass are the only paths it needs.
@@ -88,7 +90,7 @@ A tool's `console.log` and any unhandled rejection inside it go to the `onLog` o
 What toolhost does do, and what it does not:
 
 - `ctx.exec` is disabled unless you pass `capabilities: { exec: true }`. When enabled, the shell sees only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `TERM`, plus whatever you put in `capabilities.execEnv`. Your process's environment, including API keys, is not inherited. This limits accidents through the documented helper only; a tool can still spawn a process itself.
-- File helpers resolve the real path of the deepest existing ancestor and reject anything outside `workspace`, so a symlink inside the workspace that points outside is refused for reads and writes. Again, this applies to the helpers, not to `node:fs`.
+- File helpers resolve the real path of the deepest existing ancestor and reject anything outside `workspace`, so a symlink inside the workspace that points outside is refused for reads and writes, and so is a dangling one. toolhost's own `dir` is refused too, even when it sits inside the workspace, as it does in the quickstart. Again, this applies to the helpers, not to `node:fs`.
 - Model-written source is parsed before it is saved. A body that closes the function early and adds top-level code is rejected, so the module on disk has exactly two exports and runs no code at import time.
 - Names are restricted to `[A-Za-z][A-Za-z0-9_]{0,63}` and are unique ignoring case, so a name is always a safe, unambiguous file name.
 - Arguments are **not** validated against the tool's schema. The provider does that; toolhost passes them through.
@@ -123,7 +125,7 @@ Creates a host and starts its worker. Options:
 - `call(name, args)` runs a tool. Built-in tools update the registry and restart the worker. If the restart fails the change is rolled back, so the tool list never advertises something the worker cannot run.
 - `history(name)` returns previous versions, newest first.
 - `status()` returns `{ open, dir, workspace, capabilities, worker }`, where `worker` has the pid, readiness, tool names, restart and crash counts, and last exit.
-- `start()` and `stop()` are idempotent, and a stopped host can be started again.
+- `start()` and `stop()` are idempotent, and a stopped host can be started again. `stop()` waits up to `drainTimeoutMs` for running calls. A misconfigured `dir` or `workspace` rejects `start()` with `start_failed` or `invalid_argument`, never a raw Node error.
 - `registry`, `store`, `worker` are exposed for direct use.
 
 ### `ToolError`
@@ -136,7 +138,8 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 | `exists`, `not_found` | Registry state. |
 | `recursive_call`, `path_outside_workspace`, `file_not_found`, `file_error`, `invalid_path`, `fetch_failed`, `fetch_timeout`, `fetch_too_large`, `capability_disabled`, `invalid_argument` | Raised inside `ctx`. |
 | `call_failed`, `unserializable_result`, `result_too_large`, `timeout` | The tool ran and something went wrong. `call_failed` wraps whatever the tool threw and carries `details.remoteStack`. |
-| `worker_unavailable`, `startup_failed`, `host_stopped`, `dir_in_use` | Lifecycle. |
+| `worker_unavailable`, `startup_failed`, `start_failed`, `host_stopped`, `dir_in_use`, `workspace_unavailable` | Lifecycle and environment. |
+| `store_error`, `store_incompatible` | SQLite refused a write, or the database was written by a newer toolhost. |
 | `internal_error` | A bug in toolhost. Please report it. |
 
 ### Worker events
@@ -159,10 +162,14 @@ Every failure is a `ToolError` with a stable `code` and a `message` written for 
 4. The worker client waits for in-flight calls to drain, sends SIGTERM (SIGKILL after `killGraceMs`), forks a fresh worker, and waits for `ready`. Concurrent changes share one restart; calls that arrive during it wait rather than fail.
 5. If the worker cannot start, the change is rolled back and the model is told why.
 
+## Node's SQLite warning
+
+`node:sqlite` prints `ExperimentalWarning: SQLite is an experimental feature` once per process on Node 22. toolhost silences it in the worker it forks; for your own process, run with `node --disable-warning=ExperimentalWarning` or set `NODE_OPTIONS=--disable-warning=ExperimentalWarning`. Node 24 does not warn.
+
 ## Development
 
 ```sh
-npm test          # node --test, 49 tests, loopback only, a few seconds
+npm test          # node --test, 57 tests, loopback only, a few seconds
 npm run check     # syntax check
 npm run typecheck # tsc --strict over a consumer of every export
 ```

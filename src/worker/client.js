@@ -8,6 +8,30 @@ import { CONFIG_ENV, READY, RESULT, STARTUP_ERROR, WARNING } from "../protocol.j
 
 const WORKER_PATH = fileURLToPath(new URL("./main.js", import.meta.url));
 
+/**
+ * Codes the worker is allowed to assert. Anything else a tool throws, including a forged
+ * lifecycle code or a raw errno, arrives as `call_failed` with the original in
+ * `details.remoteCode`, so an application's `switch (error.code)` cannot be steered by
+ * model-written code.
+ */
+const WORKER_CODES = new Set([
+  "not_found",
+  "invalid_name",
+  "invalid_argument",
+  "invalid_path",
+  "recursive_call",
+  "path_outside_workspace",
+  "workspace_unavailable",
+  "file_not_found",
+  "file_error",
+  "fetch_failed",
+  "fetch_timeout",
+  "fetch_too_large",
+  "capability_disabled",
+  "unserializable_result",
+  "result_too_large"
+]);
+
 /** A worker that stays ready this long has recovered; the crash counter resets. */
 const HEALTHY_AFTER_MS = 30_000;
 
@@ -29,6 +53,7 @@ export class ToolWorkerClient extends EventEmitter {
   #ready = false;
   #tools = [];
   #pending = new Map();
+  #restarting = false;
   #restartCount = 0;
   #crashes = 0;
   #lastExit = null;
@@ -95,11 +120,15 @@ export class ToolWorkerClient extends EventEmitter {
     return task;
   }
 
-  /** Terminate the worker and stop supervising it. `restart()` starts it again. */
+  /**
+   * Terminate the worker and stop supervising it. Waits up to `drainTimeoutMs` for in-flight
+   * calls, like `restart()`. `restart()` starts it again.
+   */
   async stop(reason = "stop") {
     this.#stopped = true;
     this.#cancelCrashRestart();
     await this.#queue;
+    await this.#drain();
     await this.#stopChild(reason);
   }
 
@@ -107,8 +136,10 @@ export class ToolWorkerClient extends EventEmitter {
    * @param {string} name @param {unknown} args @param {{ timeoutMs?: number }} [options]
    */
   async callTool(name, args, { timeoutMs = 30_000 } = {}) {
-    await this.#crashWait?.promise; // a restart after a crash is scheduled: wait for it
-    await this.#queue; // wait out any restart in progress
+    // Only await when there is something to wait for, so in the common case the call is
+    // registered synchronously and a stop()/restart() issued in the same tick drains it.
+    if (this.#crashWait) await this.#crashWait.promise;
+    if (this.#restarting || this.#scheduled) await this.#queue;
     const child = this.#child;
     if (!child || !this.#ready) {
       throw new ToolError("worker_unavailable", "Worker is not running. Call restart() to start it.");
@@ -132,6 +163,15 @@ export class ToolWorkerClient extends EventEmitter {
   // -- lifecycle -------------------------------------------------------------------------
 
   async #restartNow(reason) {
+    this.#restarting = true;
+    try {
+      return await this.#doRestart(reason);
+    } finally {
+      this.#restarting = false;
+    }
+  }
+
+  async #doRestart(reason) {
     this.#stopped = false;
     await this.#drain();
     await this.#stopChild(`restart:${reason}`);
@@ -301,8 +341,11 @@ export class ToolWorkerClient extends EventEmitter {
         clearTimeout(pending.timer);
         if (message.ok) pending.resolve(JSON.parse(message.resultJson));
         else {
+          const remoteCode = message.error?.code;
+          const code = WORKER_CODES.has(remoteCode) ? remoteCode : "call_failed";
           pending.reject(
-            new ToolError(message.error?.code ?? "call_failed", message.error?.message ?? "Tool call failed.", {
+            new ToolError(code, message.error?.message ?? "Tool call failed.", {
+              remoteCode: code === remoteCode ? undefined : remoteCode,
               remoteStack: message.error?.stack
             })
           );

@@ -15,13 +15,25 @@ import { ToolError } from "./errors.js";
  * Synchronous on purpose: `node:sqlite` is synchronous, calls are sub-millisecond, and it
  * keeps the registry free of interleaving bugs.
  */
+/** Bumped whenever the tables change shape. A newer database is refused, not misread. */
+const SCHEMA_VERSION = 1;
+
 export class ToolStore {
   /** @param {string} dbPath */
   constructor(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    const version = this.db.prepare("PRAGMA user_version").get().user_version;
+    if (version > SCHEMA_VERSION) {
+      this.db.close();
+      throw new ToolError(
+        "store_incompatible",
+        `${dbPath} was written by a newer toolhost (schema ${version}; this version understands ${SCHEMA_VERSION}).`
+      );
+    }
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
 
       CREATE TABLE IF NOT EXISTS tools (
         name            TEXT PRIMARY KEY,
@@ -48,6 +60,8 @@ export class ToolStore {
       );
 
       CREATE INDEX IF NOT EXISTS idx_tool_versions_name ON tool_versions(tool_name, id);
+
+      PRAGMA user_version = ${SCHEMA_VERSION};
     `);
   }
 
@@ -122,12 +136,20 @@ export class ToolStore {
     return { ...previous, versionId };
   }
 
-  /** Newest first. @param {string} name @param {{ limit?: number }} [options] */
-  history(name, { limit = 20 } = {}) {
-    return this.db
-      .prepare("SELECT * FROM tool_versions WHERE tool_name = ? ORDER BY id DESC LIMIT ?")
-      .all(name, limit)
-      .map(toVersion);
+  /**
+   * Newest first. Pass `before` (a version id) to page further back.
+   * @param {string} name @param {{ limit?: number, before?: number }} [options]
+   */
+  history(name, { limit = 20, before } = {}) {
+    const rows = Number.isInteger(before)
+      ? this.db.prepare("SELECT * FROM tool_versions WHERE tool_name = ? AND id < ? ORDER BY id DESC LIMIT ?").all(name, before, limit)
+      : this.db.prepare("SELECT * FROM tool_versions WHERE tool_name = ? ORDER BY id DESC LIMIT ?").all(name, limit);
+    return rows.map(toVersion);
+  }
+
+  /** @param {string} name */
+  historyCount(name) {
+    return Number(this.db.prepare("SELECT COUNT(*) AS n FROM tool_versions WHERE tool_name = ?").get(name).n);
   }
 
   /** One history row, or null. @param {string} name @param {number} versionId */

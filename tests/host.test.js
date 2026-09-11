@@ -52,8 +52,11 @@ test("history is readable and any version, including a deleted one, can be resto
       await host.call("update_tool", { name: "v", execute_source: "return 3;" });
       assert.equal(await host.call("v", { value: "" }), 3);
 
-      const read = await host.call("read_tool", { name: "v", include_source: false, include_history: true });
+      const read = await host.call("read_tool", { name: "v", include_source: true, include_history: true });
       assert.deepEqual(read.history.map((v) => [v.operation, v.execute_source]), [["update", "return 3;"], ["update", "return 2;"], ["create", "return 1;"]]);
+      assert.equal(read.history_truncated, false);
+      const noSource = await host.call("read_tool", { name: "v", include_source: false, include_history: true });
+      assert.equal("execute_source" in noSource.history[0], false, "history source is opt-in");
       assert.deepEqual(host.history("v").map((v) => v.executeSource), ["return 3;", "return 2;", "return 1;"]);
 
       const first = read.history.at(-1).version;
@@ -340,7 +343,6 @@ test("ctx.workspace is the real path, so a symlinked workspace works with the fi
     try {
       await create(host, "w", "await ctx.writeText(ctx.workspace + '/note.txt', 'x'); return ctx.readText('note.txt');");
       assert.equal(await host.call("w", {}), "x");
-      await create(host, "b", "return 'x'.repeat(args.value.length);");
     } finally {
       await host.stop();
     }
@@ -440,6 +442,134 @@ test("a source larger than maxSourceBytes is refused before it is stored", () =>
     } finally {
       await host.stop();
     }
+  }));
+
+test("history pages past 20 versions and nothing is unreachable", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    try {
+      await create(host, "many", "return 0;");
+      for (let i = 1; i <= 25; i += 1) await host.call("update_tool", { name: "many", execute_source: `return ${i};` });
+      const first = await host.call("read_tool", { name: "many", include_source: false, include_history: true });
+      assert.equal(first.history.length, 20);
+      assert.equal(first.history_truncated, true);
+      const second = await host.call("read_tool", { name: "many", include_source: true, include_history: true, history_before: first.history_next_before });
+      assert.equal(second.history.length, 6);
+      assert.equal(second.history_truncated, false);
+      assert.equal(second.history.at(-1).operation, "create");
+      assert.equal(second.history.at(-1).execute_source, "return 0;");
+      await host.call("update_tool", { name: "many", restore_version: second.history.at(-1).version });
+      assert.equal(await host.call("many", {}), 0, "the oldest version is restorable through the model-facing API");
+      assert.equal(host.history("many", { limit: 100 }).length, 27);
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("a tool cannot forge error codes; foreign codes arrive as call_failed", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    try {
+      await create(host, "forge", "throw Object.assign(new Error('gone'), { code: args.value });");
+      for (const forged of ["host_stopped", "dir_in_use", "ENOENT", "PAYMENT_REQUIRED"]) {
+        await assert.rejects(host.call("forge", { value: forged }), (error) => error.code === "call_failed" && error.details.remoteCode === forged, forged);
+      }
+      await assert.rejects(host.call("forge", { value: "not_found" }), (error) => error.code === "not_found", "codes the worker legitimately raises pass through");
+      await create(host, "ownfs", "const fs = await import('node:fs/promises'); return fs.readFile('/definitely/not/here');");
+      await assert.rejects(host.call("ownfs", {}), (error) => error.code === "call_failed" && error.details.remoteCode === "ENOENT");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("appendText and listFiles behave and are confined; exec cwd confinement throws", () =>
+  withTempDir(async (dir) => {
+    const workspace = path.join(dir, "ws");
+    await fs.mkdir(path.join(workspace, "sub"), { recursive: true });
+    await fs.writeFile(path.join(workspace, "sub", "f.txt"), "1");
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace, capabilities: { exec: true }, ...quiet });
+    try {
+      await create(host, "app", "return ctx.appendText(args.value, 'x');");
+      await create(host, "ls", "return ctx.listFiles(args.value);");
+      await create(host, "cwd", "return ctx.exec('pwd', { cwd: args.value });");
+      assert.deepEqual(await host.call("app", { value: "log.txt" }), { path: "log.txt" });
+      await host.call("app", { value: "log.txt" });
+      assert.equal(await fs.readFile(path.join(workspace, "log.txt"), "utf8"), "xx");
+      await assert.rejects(host.call("app", { value: "../evil.txt" }), (error) => error.code === "path_outside_workspace");
+      assert.deepEqual(await host.call("ls", { value: "sub" }), [{ name: "f.txt", type: "file" }]);
+      assert.deepEqual((await host.call("ls", { value: "." })).map((e) => e.name).sort(), ["log.txt", "sub"]);
+      await assert.rejects(host.call("ls", { value: "sub/f.txt" }), (error) => error.code === "file_error");
+      await assert.rejects(host.call("ls", { value: "nope" }), (error) => error.code === "file_not_found");
+      const pwd = await host.call("cwd", { value: "sub" });
+      assert.equal(pwd.stdout.trim(), await fs.realpath(path.join(workspace, "sub")));
+      await assert.rejects(host.call("cwd", { value: ".." }), (error) => error.code === "path_outside_workspace", "confinement is thrown, not returned as a failed command");
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("toolhost's own dir is off limits to tools even when it sits inside the workspace", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, ".toolhost"), workspace: dir, ...quiet });
+    try {
+      await create(host, "peek", "return ctx.listFiles(args.value);");
+      await create(host, "clobber", "return ctx.writeText(args.value, 'CORRUPT');");
+      assert.ok((await host.call("peek", { value: "." })).some((e) => e.name === ".toolhost"), "it is visible in a listing");
+      await assert.rejects(host.call("peek", { value: ".toolhost" }), (error) => error.code === "path_outside_workspace");
+      await assert.rejects(host.call("peek", { value: ".toolhost/modules" }), (error) => error.code === "path_outside_workspace");
+      await assert.rejects(host.call("clobber", { value: ".toolhost/tools.sqlite" }), (error) => error.code === "path_outside_workspace");
+      assert.equal(await host.call("peek", { value: "." }).then((l) => l.length), 1);
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("start() failures are ToolErrors; options are validated", () =>
+  withTempDir(async (dir) => {
+    await fs.writeFile(path.join(dir, "file"), "x");
+    await assert.rejects(createToolHost({ dir: path.join(dir, "file"), workspace: dir, ...quiet }), (error) => error.code === "start_failed" && error.name === "ToolError");
+    await assert.rejects(createToolHost({ dir: path.join(dir, "h"), workspace: path.join(dir, "missing"), ...quiet }), (error) => error.code === "invalid_argument");
+    await fs.mkdir(path.join(dir, "h2"));
+    await fs.mkdir(path.join(dir, "h2", "tools.sqlite"));
+    await assert.rejects(createToolHost({ dir: path.join(dir, "h2"), workspace: dir, ...quiet }), (error) => error.code === "start_failed");
+    assert.equal(await fs.access(path.join(dir, "h2", ".lock")).then(() => true, () => false), false, "lock released after a failed start");
+    for (const bad of [{ maxResultBytes: 0 }, { callTimeoutMs: -1 }, { readyTimeoutMs: 1.5 }, { maxCrashRestarts: -1 }, { maxSourceBytes: "big" }]) {
+      assert.throws(() => new ToolHost({ dir: path.join(dir, "h3"), workspace: dir, ...bad }), (error) => error.code === "invalid_argument", JSON.stringify(bad));
+    }
+  }));
+
+test("a removed workspace yields workspace_unavailable, and fetchJson keeps its timeout with a caller signal", () =>
+  withTempDir(async (dir) => {
+    const workspace = path.join(dir, "ws");
+    await fs.mkdir(workspace);
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace, ...quiet });
+    try {
+      await create(host, "r", "return ctx.readText('x.txt');");
+      await create(host, "f", "const c = new AbortController(); return ctx.fetchJson(args.value, { timeoutMs: 100, signal: c.signal });");
+      await fs.rm(workspace, { recursive: true });
+      await assert.rejects(host.call("r", {}), (error) => error.code === "workspace_unavailable" && !error.message.includes(dir));
+      const { createServer } = await import("node:http");
+      const server = createServer(() => {});
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const started = Date.now();
+        await assert.rejects(host.call("f", { value: `http://127.0.0.1:${server.address().port}/` }), (error) => error.code === "fetch_timeout");
+        assert.ok(Date.now() - started < 1000);
+      } finally {
+        server.close();
+      }
+    } finally {
+      await host.stop();
+    }
+  }));
+
+test("stop() waits for in-flight calls", () =>
+  withTempDir(async (dir) => {
+    const host = await createToolHost({ dir: path.join(dir, "host"), workspace: dir, ...quiet });
+    await create(host, "slow", "await new Promise((r) => setTimeout(r, 200)); return 'done';");
+    const inflight = host.call("slow", {});
+    await host.stop();
+    assert.equal(await inflight, "done");
   }));
 
 test("exec runs with a minimal environment when enabled", () =>
