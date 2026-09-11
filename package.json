@@ -1,0 +1,51 @@
+{
+  "name": "toolhost",
+  "version": "0.1.0",
+  "description": "Let an LLM write its own tools at runtime. Each tool is parsed, versioned in SQLite, and hot-reloaded into an isolated child process.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.js\"",
+    "check": "node --check src/*.js src/worker/*.js"
+  },
+  "dependencies": {
+    "acorn": "^8.15.0"
+  },
+  "keywords": [
+    "llm",
+    "agent",
+    "tools",
+    "tool-use",
+    "function-calling",
+    "hot-reload",
+    "sqlite",
+    "anthropic",
+    "openai"
+  ],
+  "author": "Muhammad Zulali <mzulali0@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MZULALI/toolhost.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MZULALI/toolhost/issues"
+  },
+  "homepage": "https://github.com/MZULALI/toolhost#readme"
+}
